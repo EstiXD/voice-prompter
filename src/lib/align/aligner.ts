@@ -31,9 +31,9 @@ export const INITIAL_STATE: AlignState = {
 
 export const PARAMS = {
   /** unidades hacia atrás que se consideran (repeticiones, tartamudeo) */
-  BACK: 6,
-  /** unidades hacia adelante en modo normal (palabras saltadas) */
-  AHEAD: 10,
+  BACK: 8,
+  /** unidades hacia adelante en modo normal (palabras o una frase corta saltadas) */
+  AHEAD: 14,
   /** hacia adelante cuando llevamos ≥3 fallos (probable salto de línea) */
   AHEAD_LOST: 30,
   FWD_PEN: 0.015,

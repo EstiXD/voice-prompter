@@ -42,12 +42,71 @@ describe("tokenize", () => {
   it("tokeniza líneas y unidades", () => {
     const s = tokenizeScript("Hola mundo.\n\nEn 2024 — vendimos 350.");
     expect(s.tokens.map((t) => t.raw)).toEqual(["Hola", "mundo.", "En", "2024", "—", "vendimos", "350."]);
-    expect(s.lines.length).toBe(3);
+    expect(s.blocks.map((b) => b.type)).toEqual(["paragraph", "blank", "paragraph"]);
     expect(s.tokens[4].alignable).toBe(false);
     expect(s.units.map((u) => u.norm)).toEqual([
       "hola", "mundo", "en", "dos", "mil", "veinticuatro", "vendimos", "trescientos", "cincuenta",
     ]);
     expect(s.firstUnitOfToken).toEqual([0, 1, 2, 3, -1, 6, 7]);
+    expect(s.readableWords).toBe(6);
+  });
+});
+
+describe("markdown del guion", () => {
+  it("títulos, notas, viñetas y separadores no producen unidades", () => {
+    const s = tokenizeScript([
+      "# GUION BREVE — Audio",
+      "### *Radio Savia* — \"Cantando\"",
+      "> `//` = pausa corta · lo entre *[corchetes]* no se lee",
+      "// comentario del autor",
+      "---",
+      "- Ensaya una vez con cronómetro.",
+      "1. Respira en las pausas.",
+      "",
+      "Hola, buenos días.",
+    ].join("\n"));
+    expect(s.blocks.map((b) => b.type)).toEqual(["heading", "heading", "quote", "hr", "list", "blank", "paragraph"]);
+    expect(s.units.map((u) => u.norm)).toEqual(["hola", "buenos", "dias"]);
+    expect(s.readableWords).toBe(3);
+  });
+
+  it("negrita y cursiva se leen y conservan formato; indicaciones y pausas no", () => {
+    const s = tokenizeScript("*[Tono cálido, sonríe al hablar.]*\nMi nombre es **Estiven** y estudio *ingeniería*. // Gracias. ///");
+    const words = s.tokens.filter((t) => t.kind === "word").map((t) => t.raw);
+    expect(words).toEqual(["Mi", "nombre", "es", "Estiven", "y", "estudio", "ingeniería.", "Gracias."]);
+    expect(s.tokens.find((t) => t.raw === "Estiven")?.bold).toBe(true);
+    expect(s.tokens.find((t) => t.raw === "ingeniería.")?.italic).toBe(true);
+    expect(s.tokens.filter((t) => t.kind === "direction").map((t) => t.raw)).toEqual(["[Tono", "cálido,", "sonríe", "al", "hablar.]"]);
+    expect(s.tokens.filter((t) => t.kind === "pause").map((t) => t.raw)).toEqual(["//", "///"]);
+    expect(s.units.map((u) => u.norm)).toEqual(["mi", "nombre", "es", "estiven", "y", "estudio", "ingenieria", "gracias"]);
+  });
+
+  it("pausa pegada a la palabra y negrita parcial de línea", () => {
+    const s = tokenizeScript("**Duración estimada: 3:50 min** · ~540 palabras.//");
+    expect(s.tokens.map((t) => t.raw)).toEqual(["Duración", "estimada:", "3:50", "min", "·", "~540", "palabras.", "//"]);
+    expect(s.tokens[0].bold).toBe(true);
+    expect(s.tokens[5].bold).toBe(false);
+    expect(s.tokens.at(-1)?.kind).toBe("pause");
+  });
+
+  it("guion real: la voz sigue el contenido y salta títulos/notas sin perderse", () => {
+    const s = tokenizeScript([
+      "### PRESENTACIÓN · 0:00 – 0:20",
+      "*[Tono cálido, sonríe al hablar.]*",
+      "",
+      "Hola, buenos días. Mi nombre es Estiven Alejandro Carvajal Muñoz, estudiante de Ingeniería de Software y Datos. //",
+      "",
+      "---",
+      "",
+      "### 1. ¿CUÁL ES EL PROPÓSITO? · 0:20 – 0:50",
+      "*[Tono seguro, tranquilo.]*",
+      "",
+      "El propósito del video es darle voz a las familias que buscan a sus desaparecidos. // No es una noticia: es un testimonio. ///",
+    ].join("\n"));
+    const st = run(s, ["hola buenos dias mi nombre es estiven alejandro carvajal muñoz estudiante de ingenieria de software y datos", "el proposito del video es darle voz a las familias"]);
+    expect(s.tokens[tokenOfUnit(s, st.committed)].raw).toBe("familias");
+    const st2 = run(s, ["que buscan a sus desaparecidos no es una noticia es un testimonio"], st);
+    expect(s.tokens[tokenOfUnit(s, st2.committed)].raw).toBe("testimonio.");
   });
 });
 

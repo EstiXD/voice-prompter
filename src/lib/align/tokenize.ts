@@ -1,12 +1,20 @@
 import { numberTokenToWords } from "./numbers";
+import { parseMarkdown, type InlineRun } from "./markdown";
+
+export type TokenKind = "word" | "pause" | "direction";
 
 export type ScriptToken = {
   /** índice del token en el guion */
   idx: number;
   /** texto original tal cual se pinta */
   raw: string;
-  /** línea (párrafo visual) a la que pertenece */
-  line: number;
+  /** palabra leíble, marca de pausa (// ///) o indicación [entre corchetes] */
+  kind: TokenKind;
+  bold: boolean;
+  italic: boolean;
+  code: boolean;
+  /** índice del bloque (párrafo) al que pertenece */
+  block: number;
   /** true si tiene al menos una unidad alineable */
   alignable: boolean;
 };
@@ -21,17 +29,23 @@ export type Unit = {
   fold: string;
 };
 
-export type ScriptLine = {
-  /** índices de tokens de la línea; vacío = línea en blanco (espaciador) */
-  tokens: number[];
-};
+/** Bloque visual del guion. Solo los párrafos tienen tokens (se leen). */
+export type ScriptBlock =
+  | { type: "paragraph"; tokens: number[] }
+  | { type: "heading"; level: number; runs: InlineRun[] }
+  | { type: "quote"; runs: InlineRun[] }
+  | { type: "list"; ordered: boolean; items: InlineRun[][] }
+  | { type: "hr" }
+  | { type: "blank" };
 
 export type Script = {
   tokens: ScriptToken[];
   units: Unit[];
-  lines: ScriptLine[];
+  blocks: ScriptBlock[];
   /** primera unidad de cada token (-1 si no alineable) */
   firstUnitOfToken: number[];
+  /** palabras que sí se leen (para conteo y duración estimada) */
+  readableWords: number;
 };
 
 const ABREVIATURAS: Record<string, string[]> = {
@@ -101,27 +115,80 @@ export function normalizeTranscript(text: string): string[] {
   return text.split(/\s+/).flatMap(expandToken);
 }
 
+const PAUSE_RE = /^\/{2,}$/;
+
+type WordPiece = { raw: string; bold: boolean; italic: boolean; code: boolean };
+
+/** Divide los runs de un párrafo en palabras (por espacios) conservando el formato. */
+function splitWords(runs: InlineRun[]): WordPiece[] {
+  const out: WordPiece[] = [];
+  let cur: WordPiece | null = null;
+  for (const run of runs) {
+    for (const ch of run.text) {
+      if (/\s/.test(ch)) {
+        if (cur) out.push(cur);
+        cur = null;
+      } else if (cur) {
+        cur.raw += ch;
+      } else {
+        cur = { raw: ch, bold: run.bold, italic: run.italic, code: run.code };
+      }
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 export function tokenizeScript(text: string): Script {
   const tokens: ScriptToken[] = [];
   const units: Unit[] = [];
-  const lines: ScriptLine[] = [];
+  const blocks: ScriptBlock[] = [];
   const firstUnitOfToken: number[] = [];
+  let readableWords = 0;
 
-  const rawLines = text.replace(/\r\n?/g, "\n").split("\n");
-  rawLines.forEach((lineText, lineIdx) => {
-    const line: ScriptLine = { tokens: [] };
-    for (const raw of lineText.split(/\s+/).filter(Boolean)) {
-      const idx = tokens.length;
-      const words = expandToken(raw);
-      firstUnitOfToken.push(words.length ? units.length : -1);
-      for (const norm of words) {
-        units.push({ u: units.length, tokenIdx: idx, norm, fold: fold(norm) });
-      }
-      tokens.push({ idx, raw, line: lineIdx, alignable: words.length > 0 });
-      line.tokens.push(idx);
+  for (const b of parseMarkdown(text)) {
+    if (b.type !== "paragraph") {
+      blocks.push(b);
+      continue;
     }
-    lines.push(line);
-  });
+    const blockIdx = blocks.length;
+    const tokenIdxs: number[] = [];
+    let inDirection = false;
 
-  return { tokens, units, lines, firstUnitOfToken };
+    const pushToken = (piece: WordPiece, kind: TokenKind) => {
+      const idx = tokens.length;
+      const words = kind === "word" ? expandToken(piece.raw) : [];
+      firstUnitOfToken.push(words.length ? units.length : -1);
+      for (const norm of words) units.push({ u: units.length, tokenIdx: idx, norm, fold: fold(norm) });
+      if (words.length) readableWords++;
+      tokens.push({ idx, raw: piece.raw, kind, bold: piece.bold, italic: piece.italic, code: piece.code, block: blockIdx, alignable: words.length > 0 });
+      tokenIdxs.push(idx);
+    };
+
+    for (const piece of splitWords(b.runs)) {
+      // pausas pegadas a una palabra: "curso.//" → "curso." + "//"
+      const glued = /^(.*?[^/])(\/{2,})$/.exec(piece.raw);
+      if (glued) {
+        pushToken({ ...piece, raw: glued[1] }, inDirection ? "direction" : "word");
+        pushToken({ ...piece, raw: glued[2] }, "pause");
+        continue;
+      }
+      if (PAUSE_RE.test(piece.raw)) {
+        pushToken(piece, "pause");
+        continue;
+      }
+      // indicaciones [entre corchetes]: no se leen
+      const opens = piece.raw.includes("[");
+      const closes = piece.raw.includes("]") && piece.raw.lastIndexOf("]") > piece.raw.lastIndexOf("[");
+      if (opens || inDirection) {
+        pushToken(piece, "direction");
+        inDirection = opens ? !closes : !closes;
+        continue;
+      }
+      pushToken(piece, "word");
+    }
+    blocks.push({ type: "paragraph", tokens: tokenIdxs });
+  }
+
+  return { tokens, units, blocks, firstUnitOfToken, readableWords };
 }

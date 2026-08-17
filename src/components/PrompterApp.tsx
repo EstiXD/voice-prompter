@@ -70,7 +70,7 @@ export function PrompterApp() {
     onWords: aligner.feed,
   });
   // funciones estables de los hooks (los objetos devueltos cambian en cada render)
-  const { start: micStart, stop: micStop, setRnnoise: micSetRnnoise, setEnhance: micSetEnhance, pipeline } = mic;
+  const { start: micStart, stop: micStop, setRnnoise: micSetRnnoise, pipeline } = mic;
   const { start: speechStart, stop: speechStop } = speech;
   const { start: recStart, stop: recStop, pause: recPause, resume: recResume, reset: recReset } = recorder;
   const { feed: alignFeed, reset: alignReset, nudge: alignNudge, setToToken: alignSetToToken, store: alignStore } = aligner;
@@ -111,7 +111,7 @@ export function PrompterApp() {
     const p = await micStart({
       deviceId: settings.deviceId || undefined,
       rnnoise: settings.rnnoise,
-      enhance: settings.enhance,
+      enhance: true, // mejora de voz siempre activa (pasa-altos + compresor + limitador)
       nativeProcessing: settings.nativeProcessing,
     });
     if (!p) {
@@ -181,9 +181,6 @@ export function PrompterApp() {
     },
     [patchSettings, pipeline, micSetRnnoise],
   );
-  useEffect(() => {
-    if (pipeline) micSetEnhance(settings.enhance);
-  }, [settings.enhance, pipeline, micSetEnhance]);
   // cambio de idioma en vivo → reiniciar reconocedor
   const langRef = useRef(settings.lang);
   useEffect(() => {
@@ -286,7 +283,7 @@ export function PrompterApp() {
     }
   }, []);
 
-  const wordsRead = useSyncExternalStore(alignStore.subscribe, alignStore.get, alignStore.get).committedToken + 1;
+  const wordsRead = useSyncExternalStore(alignStore.subscribe, alignStore.get, alignStore.get).committed + 1;
 
   const look = useMemo(
     () => ({
@@ -349,7 +346,15 @@ export function PrompterApp() {
             )}
             <Prompter script={script} store={alignStore} look={look} follow={phase !== "finished"} onWordClick={alignSetToToken} />
             {phase === "finished" && (
-              <DownloadPanel recording={recorder.recording} wordsRead={wordsRead} wordsTotal={script.tokens.length} onNewTake={newTake} onEdit={goEdit} />
+              <DownloadPanel
+                recording={recorder.recording}
+                wordsRead={wordsRead}
+                wordsTotal={script.units.length}
+                format={settings.exportFormat}
+                onFormat={(f) => patchSettings({ exportFormat: f })}
+                onNewTake={newTake}
+                onEdit={goEdit}
+              />
             )}
           </>
         )}

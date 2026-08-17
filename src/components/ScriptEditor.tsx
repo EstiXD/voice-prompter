@@ -3,6 +3,7 @@
 import { useMemo } from "react";
 import { IconArrowRight, IconSparkle, IconTrash } from "./icons";
 import { SAMPLE_SCRIPT } from "@/lib/sample";
+import { tokenizeScript } from "@/lib/align/tokenize";
 
 type Props = {
   value: string;
@@ -13,7 +14,7 @@ type Props = {
 const WPM = 140;
 
 export function ScriptEditor({ value, onChange, onDone }: Props) {
-  const words = useMemo(() => (value.trim() ? value.trim().split(/\s+/).length : 0), [value]);
+  const words = useMemo(() => (value.trim() ? tokenizeScript(value).readableWords : 0), [value]);
   const minutes = words / WPM;
   const mm = Math.floor(minutes);
   const ss = Math.round((minutes - mm) * 60);
@@ -46,8 +47,8 @@ export function ScriptEditor({ value, onChange, onDone }: Props) {
 
       <footer className="rise-3 mt-4 flex flex-wrap items-center gap-3">
         <div className="mr-auto flex items-center gap-4 text-sm text-paper-dim">
-          <span>
-            <span className="font-mono tabular-nums text-paper">{words}</span> palabras
+          <span title="Solo cuenta lo que se lee: títulos, notas e indicaciones no suman">
+            <span className="font-mono tabular-nums text-paper">{words}</span> palabras leíbles
           </span>
           {words > 0 && (
             <span>
@@ -69,11 +70,23 @@ export function ScriptEditor({ value, onChange, onDone }: Props) {
         </button>
       </footer>
 
-      <ol className="rise-3 mt-8 grid gap-3 text-sm text-paper-dim sm:grid-cols-3">
+      <details className="rise-3 mt-5 rounded-2xl border border-line bg-surface/60 px-4 py-3 text-sm text-paper-dim open:bg-surface">
+        <summary className="cursor-pointer select-none font-semibold text-paper">Formato del guion (Markdown ligero)</summary>
+        <div className="mt-3 grid gap-x-6 gap-y-2 sm:grid-cols-2">
+          <p><kbd className="kbd">**negrita**</kbd> y <kbd className="kbd">*cursiva*</kbd> — se leen y se ven así.</p>
+          <p><kbd className="kbd"># Título</kbd> <kbd className="kbd">## Sección</kbd> — títulos, no se leen.</p>
+          <p><kbd className="kbd">&gt; nota</kbd> o <kbd className="kbd">{"// nota"}</kbd> — comentarios, no se leen.</p>
+          <p><kbd className="kbd">*[indicación]*</kbd> — tono/gesto entre corchetes, no se lee.</p>
+          <p><kbd className="kbd">{"//"}</kbd> <kbd className="kbd">{"///"}</kbd> — marcas de pausa, no se leen.</p>
+          <p><kbd className="kbd">- viñeta</kbd> y <kbd className="kbd">---</kbd> — recordatorios y separadores, no se leen.</p>
+        </div>
+      </details>
+
+      <ol className="rise-3 mt-6 grid gap-3 text-sm text-paper-dim sm:grid-cols-3">
         {[
           ["1", "Pega el guion", "Cualquier texto. Los números y nombres propios también cuentan."],
           ["2", "Graba y lee", "El micrófono escucha; cada palabra se ilumina y el texto se desplaza solo."],
-          ["3", "Descarga", "Audio limpio en WebM/Opus o WAV. Nada sale de tu navegador."],
+          ["3", "Descarga", "WAV, MP3, MP4, FLAC, OGG o el original. Nada sale de tu navegador."],
         ].map(([n, t, d]) => (
           <li key={n} className="card flex gap-3 p-4">
             <span className="wordmark text-2xl leading-none text-amber">{n}</span>

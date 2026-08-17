@@ -2,15 +2,31 @@
 
 Teleprompter web que **sigue tu voz**: pegas el guion, pulsas grabar y, mientras
 lees, la palabra que dices se ilumina y el texto avanza solo. Graba **solo tu
-voz** con supresión de ruido (RNNoise) y mejora de voz, y al terminar descargas
-el audio (WebM/Opus o WAV). Sin cuenta, sin backend: todo ocurre en el navegador.
+voz** con supresión de ruido (RNNoise) y mejora de voz siempre activa, y al
+terminar descargas el audio en **WAV, MP3, MP4 (AAC), FLAC, OGG o el original**.
+Sin cuenta, sin backend: todo ocurre en el navegador.
+
+## Formato del guion (Markdown ligero)
+
+| Escribes | Se ve como | ¿Se lee / alinea? |
+| --- | --- | --- |
+| `**negrita**`, `*cursiva*`, `` `código` `` | negrita, cursiva, mono | Sí |
+| `# Título`, `## Sección`, `### Bloque` | títulos | No |
+| `> nota` o `// nota` | nota al margen | No |
+| `*[Tono cálido, sonríe]*` (corchetes) | indicación en cursiva tenue | No |
+| `//` y `///` | marcas de pausa | No |
+| `- viñeta`, `1. lista`, `---` | recordatorios y separadores | No |
+
+Solo el texto normal de los párrafos cuenta como "palabras leíbles" y mueve el
+cursor; lo demás se muestra como estructura y el reconocedor lo ignora.
 
 ## Cómo funciona
 
 ```
-micrófono → [RNNoise wasm] → pasa-altos → compresor → limitador ─┬─ MediaRecorder → .webm / .wav
+micrófono → [RNNoise wasm] → pasa-altos → compresor → limitador ─┬─ MediaRecorder (WebM/Opus) → conversión en el navegador
+                                                                │     (mediabunny + WebCodecs/WASM) → wav · mp3 · mp4 · flac · ogg
                                                                 └─ Web Speech API (Chrome 139+ recibe el audio ya limpio)
-Web Speech (interinos + finales) → alineador difuso (src/lib/align) → palabra actual + auto-scroll
+Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → alineador difuso (src/lib/align) → palabra actual + auto-scroll
 ```
 
 - **Reconocimiento**: Web Speech API del navegador (gratis). Chrome/Edge de
@@ -22,10 +38,14 @@ Web Speech (interinos + finales) → alineador difuso (src/lib/align) → palabr
   (casa/caza, a ver/haber), empata con similitud difusa en una ventana alrededor
   del cursor y se re-sincroniza por "ancla" si te saltas líneas o improvisas.
   Tiene tests (`pnpm test`).
-- **Audio** (`src/lib/audio`): cadena Web Audio a 48 kHz; RNNoise via
+- **Audio** (`src/lib/audio`): cadena Web Audio a 48 kHz mono; RNNoise via
   `@sapphi-red/web-noise-suppressor` (worklet + wasm copiados a
   `public/worklets/` en `postinstall`). Si RNNoise no carga, se degrada a la
   supresión nativa del navegador.
+- **Exportación** (`src/lib/audio/convert.ts`): `mediabunny` convierte la toma
+  al formato elegido usando WebCodecs; si el navegador no trae el códec, carga
+  bajo demanda los encoders WASM `@mediabunny/mp3-encoder`, `aac-encoder` y
+  `flac-encoder`. El WAV tiene además un respaldo con Web Audio.
 
 ## Desarrollo
 

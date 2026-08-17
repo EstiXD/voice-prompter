@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { IconX } from "./icons";
 import { LANGS } from "@/lib/speech/langs";
+import { EXPORT_FORMATS } from "@/lib/audio/formats";
 import type { PrompterSettings } from "@/lib/persist";
 import type { MicDevice } from "@/hooks/useMediaDevices";
 import type { Support } from "@/lib/speech/support";
@@ -123,12 +124,28 @@ export function SettingsPanel({ open, onClose, settings, onChange, devices, supp
             <Row label="Supresión de ruido IA" hint={rnnoiseActive || !locked ? "RNNoise: elimina ventilador, tráfico, teclado. Recomendado." : "No disponible en este navegador; se usa la supresión nativa."} htmlFor="rnnoise">
               <Switch id="rnnoise" checked={settings.rnnoise} onChange={(v) => onChange({ rnnoise: v })} disabled={!support?.audioWorklet} />
             </Row>
-            <Row label="Mejora de voz" hint="Pasa-altos + compresor + limitador: voz pareja y presente, sin picos." htmlFor="enhance">
-              <Switch id="enhance" checked={settings.enhance} onChange={(v) => onChange({ enhance: v })} />
-            </Row>
             <Row label="Procesado del navegador" hint="Cancelación de eco, supresión y ganancia automática nativas." htmlFor="native">
               <Switch id="native" checked={settings.nativeProcessing} onChange={(v) => onChange({ nativeProcessing: v })} disabled={locked} />
             </Row>
+            <p className="pb-2 text-xs leading-snug text-paper-mute">
+              La mejora de voz (pasa-altos + compresor + limitador) va siempre activa: voz pareja y presente, sin picos.
+            </p>
+            <div className="py-3">
+              <label htmlFor="fmt" className="mb-2 block text-sm font-semibold text-paper">Formato de descarga</label>
+              <select
+                id="fmt"
+                className="field w-full"
+                value={settings.exportFormat}
+                onChange={(e) => onChange({ exportFormat: e.target.value as PrompterSettings["exportFormat"] })}
+              >
+                {EXPORT_FORMATS.map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.value === "original" ? "Original (WebM/Opus; M4A en Safari)" : `${f.label} · ${f.hint}`}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-paper-mute">La conversión se hace en tu navegador al descargar.</p>
+            </div>
           </section>
 
           <section className="mt-2 border-t border-line pt-4">

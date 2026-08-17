@@ -329,6 +329,62 @@ body {
 .w[data-state="pending"] { color: var(--color-paper); }
 .w[data-state="pending"]:not(:hover) { background: transparent; }
 
+/* Formato inline y bloques no leíbles (títulos, notas, viñetas, separadores) */
+.w-b { font-weight: 800; }
+.w-i { font-style: italic; }
+.w-code { font-family: var(--font-mono); font-size: 0.85em; background: rgb(255 255 255 / 0.06); border-radius: 0.2em; padding: 0 0.2em; }
+.w[data-kind="direction"] { color: var(--color-paper-mute); font-style: italic; font-size: 0.68em; text-shadow: none; background: transparent; }
+.w[data-kind="pause"] { color: rgb(255 177 74 / 0.6); font-family: var(--font-mono); font-size: 0.6em; letter-spacing: 0.08em; vertical-align: middle; text-shadow: none; background: transparent; }
+.w[data-kind="direction"][data-state="done"],
+.w[data-kind="pause"][data-state="done"] { opacity: 0.4; }
+
+.p-heading {
+  color: var(--color-amber-soft);
+  font-weight: 700;
+  font-size: calc(var(--fs) * 0.42);
+  line-height: 1.3;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 1.4em 0 0.6em;
+  padding-bottom: 0.4em;
+  border-bottom: 1px solid rgb(255 177 74 / 0.18);
+}
+.p-h1 {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-weight: 500;
+  font-variation-settings: "opsz" 48, "SOFT" 40, "WONK" 1;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  font-size: calc(var(--fs) * 0.85);
+  color: var(--color-paper);
+  border-bottom: 0;
+  margin-top: 0.4em;
+}
+.p-h2 { font-size: calc(var(--fs) * 0.55); text-transform: none; letter-spacing: 0; }
+.p-note {
+  color: var(--color-paper-mute);
+  font-style: italic;
+  font-size: calc(var(--fs) * 0.5);
+  line-height: 1.45;
+  border-left: 3px solid var(--color-line-strong);
+  padding-left: 0.8em;
+  margin: 0.4em 0 0.9em;
+}
+.p-note code, .p-list code { font-family: var(--font-mono); font-style: normal; background: rgb(255 255 255 / 0.06); border-radius: 0.2em; padding: 0 0.25em; }
+.p-list {
+  color: var(--color-paper-mute);
+  font-size: calc(var(--fs) * 0.5);
+  line-height: 1.5;
+  margin: 0.4em 0 0.9em;
+  padding-left: 1.4em;
+  list-style: disc;
+}
+.p-list-ol { list-style: decimal; }
+.p-list li { margin: 0.15em 0; }
+.p-hr { border: 0; border-top: 1px solid var(--color-line-strong); margin: 1.1em 0; }
+.p-blank { height: 0.5em; }
+
 /* Banda de foco: la línea de lectura, con marcas de cue a los lados */
 .focus-band {
   position: absolute;

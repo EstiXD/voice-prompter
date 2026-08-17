@@ -76,6 +76,10 @@ export class MicPipeline {
     this.limiter.release.value = 0.1;
 
     this.dest = ctx.createMediaStreamDestination();
+    // Voz = mono. Sin esto el stream sale estéreo (mono duplicado) y los
+    // archivos pesan el doble.
+    this.dest.channelCount = 1;
+    this.dest.channelCountMode = "explicit";
     this.processedStream = this.dest.stream;
 
     this.analyser = ctx.createAnalyser();

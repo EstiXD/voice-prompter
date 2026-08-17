@@ -2,6 +2,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, type CSSProperties, type MouseEvent } from "react";
 import type { Script } from "@/lib/align/tokenize";
+import type { InlineRun } from "@/lib/align/markdown";
 import type { CursorSnapshot, CursorStore } from "@/hooks/useAligner";
 
 export type PrompterLook = {
@@ -31,6 +32,70 @@ function stateFor(t: number, snap: CursorSnapshot): WordState {
   if (t > cur) return "pending";
   if (t <= snap.committedToken) return "done";
   return "live";
+}
+
+function renderRuns(runs: InlineRun[]) {
+  return runs.map((r, i) => {
+    let node: React.ReactNode = r.text;
+    if (r.code) node = <code key={i}>{node}</code>;
+    if (r.italic) node = <em key={i}>{node}</em>;
+    if (r.bold) node = <strong key={i}>{node}</strong>;
+    return typeof node === "string" ? <span key={i}>{node}</span> : node;
+  });
+}
+
+/** Bloques del guion. Solo los párrafos llevan spans .w con data-i (se leen). */
+function renderBlocks(script: Script) {
+  return script.blocks.map((b, bi) => {
+    switch (b.type) {
+      case "blank":
+        return <div key={bi} className="p-blank" aria-hidden="true" />;
+      case "hr":
+        return <hr key={bi} className="p-hr" />;
+      case "heading":
+        return (
+          <div key={bi} className={`p-heading p-h${Math.min(b.level, 3)}`} role="heading" aria-level={b.level}>
+            {renderRuns(b.runs)}
+          </div>
+        );
+      case "quote":
+        return (
+          <div key={bi} className="p-note">
+            {renderRuns(b.runs)}
+          </div>
+        );
+      case "list":
+        return b.ordered ? (
+          <ol key={bi} className="p-list p-list-ol">
+            {b.items.map((it, i) => (
+              <li key={i}>{renderRuns(it)}</li>
+            ))}
+          </ol>
+        ) : (
+          <ul key={bi} className="p-list">
+            {b.items.map((it, i) => (
+              <li key={i}>{renderRuns(it)}</li>
+            ))}
+          </ul>
+        );
+      case "paragraph":
+        return (
+          <p key={bi}>
+            {b.tokens.map((ti) => {
+              const t = script.tokens[ti];
+              const cls = `w${t.bold ? " w-b" : ""}${t.italic ? " w-i" : ""}${t.code ? " w-code" : ""}`;
+              return (
+                <span key={ti}>
+                  <span className={cls} data-i={ti} data-kind={t.kind} data-state="pending">
+                    {t.raw}
+                  </span>{" "}
+                </span>
+              );
+            })}
+          </p>
+        );
+    }
+  });
 }
 
 /** Zona de lectura: palabras como <span>, pintado imperativo por índice, auto-scroll. */
@@ -175,25 +240,7 @@ export const Prompter = memo(function Prompter({ script, store, look, follow, on
     [look.fontSize, look.lineHeight, look.marginPct, look.focusY],
   );
 
-  const content = useMemo(
-    () =>
-      script.lines.map((line, li) =>
-        line.tokens.length === 0 ? (
-          <p key={li} className="blank" aria-hidden="true" />
-        ) : (
-          <p key={li}>
-            {line.tokens.map((ti) => (
-              <span key={ti}>
-                <span className="w" data-i={ti} data-state="pending">
-                  {script.tokens[ti].raw}
-                </span>{" "}
-              </span>
-            ))}
-          </p>
-        ),
-      ),
-    [script],
-  );
+  const content = useMemo(() => renderBlocks(script), [script]);
 
   return (
     <div className="prompter" data-mirror={look.mirror} style={style}>

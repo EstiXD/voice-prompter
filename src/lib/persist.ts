@@ -1,4 +1,5 @@
 // Guion y ajustes en localStorage (no perder el texto al recargar).
+import { DEFAULT_EXPORT_FORMAT, isExportFormat, type ExportFormat } from "@/lib/audio/formats";
 
 const KEY = "voice-prompter:v1";
 
@@ -11,10 +12,13 @@ export type PrompterSettings = {
   lang: string;
   deviceId: string;
   rnnoise: boolean;
-  enhance: boolean;
   nativeProcessing: boolean;
   recognizeProcessed: boolean;
+  /** formato de descarga (ver lib/audio/formats) */
+  exportFormat: ExportFormat;
 };
+
+export type { ExportFormat };
 
 export const DEFAULT_SETTINGS: PrompterSettings = {
   fontSize: 44,
@@ -25,9 +29,9 @@ export const DEFAULT_SETTINGS: PrompterSettings = {
   lang: "es-MX",
   deviceId: "",
   rnnoise: true,
-  enhance: true,
   nativeProcessing: true,
   recognizeProcessed: true,
+  exportFormat: DEFAULT_EXPORT_FORMAT,
 };
 
 export type Persisted = { script: string; settings: PrompterSettings };
@@ -38,9 +42,12 @@ export function loadPersisted(): Persisted | null {
     const raw = window.localStorage.getItem(KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<Persisted>;
+    const settings = { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) } as PrompterSettings & { enhance?: boolean };
+    delete settings.enhance; // ajuste retirado: la mejora de voz siempre va activa
+    if (!isExportFormat(settings.exportFormat)) settings.exportFormat = DEFAULT_EXPORT_FORMAT;
     return {
       script: typeof parsed.script === "string" ? parsed.script : "",
-      settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
+      settings,
     };
   } catch {
     return null;
