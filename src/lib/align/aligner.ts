@@ -1,25 +1,41 @@
 // Alineador guion ↔ voz. Puro: sin DOM, sin React. Recibe el transcript
 // (interino o final) y mueve un cursor sobre las unidades del guion.
 //
-// Idea: el interino se recalcula SIEMPRE desde `committed` (robusto a
-// revisiones del ASR); el final avanza `committed`. Cada palabra dicha busca
-// su mejor empate en una ventana alrededor del cursor con penalización por
-// distancia; si el lector se pierde (improvisa, salta) se amplía la ventana y
-// se re-sincroniza por "ancla" de 3 palabras.
+// El interino se recalcula SIEMPRE desde `committed` (robusto a las
+// revisiones del reconocedor); el final avanza `committed`.
+//
+// Cómo se decide dónde vas: alineación de secuencias (programación dinámica,
+// como un Smith-Waterman con pesos) de TODAS las palabras dichas contra una
+// ventana del guion alrededor del cursor:
+//   · cada empate suma según lo informativa que es la palabra: "y", "de",
+//     "la" casi nada; "Estiven", "presupuesto" mucho. Así una palabra corta
+//     repetida nunca arrastra el cursor a su otra aparición.
+//   · saltarse palabras del guion cuesta (poco si son 1–3 —el reconocedor se
+//     come palabras—, más si es una línea entera) y decir palabras que no
+//     están cuesta un poco (muletillas casi nada).
+//   · se queda el camino de mayor puntaje: un salto solo gana cuando varias
+//     palabras seguidas lo confirman.
+// Si nada de la ventana empata, se busca la frase en todo el guion por
+// "ancla" de 3 palabras (te fuiste a otro párrafo).
 
 import type { Script } from "./tokenize";
 import { fold, normalizeTranscript } from "./tokenize";
 import { similarity, threshold } from "./similarity";
+
+/** Salto detectado (te saltaste o volviste a leer un trozo). */
+export type AlignJump = { from: number; to: number; dir: "ahead" | "back" };
 
 export type AlignState = {
   /** última unidad confirmada por un resultado final (-1 = nada aún) */
   committed: number;
   /** última unidad según el interino actual (>= committed normalmente) */
   provisional: number;
-  /** palabras seguidas sin empate al momento del último commit */
+  /** palabras seguidas sin empate al final de lo dicho */
   missStreak: number;
   /** clave del último final aplicado (dedupe tras reinicio del reconocedor) */
   lastFinalKey: string;
+  /** salto detectado en el último texto procesado (null = lectura seguida) */
+  jump?: AlignJump | null;
 };
 
 export const INITIAL_STATE: AlignState = {
@@ -27,102 +43,82 @@ export const INITIAL_STATE: AlignState = {
   provisional: -1,
   missStreak: 0,
   lastFinalKey: "",
+  jump: null,
 };
 
 export const PARAMS = {
-  /** unidades hacia atrás que se consideran (repeticiones, tartamudeo) */
-  BACK: 8,
-  /** unidades hacia adelante en modo normal (palabras o una frase corta saltadas) */
-  AHEAD: 14,
-  /** hacia adelante cuando llevamos ≥3 fallos (probable salto de línea) */
-  AHEAD_LOST: 30,
-  FWD_PEN: 0.015,
-  BACK_PEN: 0.06,
-  EXPECTED_BONUS: 0.05,
-  LOOKAHEAD_BONUS: 0.15,
-  ACCEPT: 0.6,
+  /** unidades hacia atrás que entran en la ventana (repeticiones) */
+  BACK: 10,
+  /** unidades hacia adelante además de lo que mide lo dicho */
+  AHEAD: 40,
+  /** salto máximo entre dos empates seguidos dentro de la ventana */
+  MAX_GAP: 12,
+  /** saltos ≥ esto se avisan como "te saltaste" */
+  JUMP_NOTICE: 5,
+  /** puntaje por debajo del mejor con el que se poda un estado */
+  BEAM: 4,
   ANCHOR_K: 3,
   ANCHOR_MIN: 2,
 } as const;
 
-/** Muletillas: si no empatan, no cuentan como fallo. Formas plegadas. */
-const FILLERS = new Set([
-  "e", "em", "m", "a", "este", "esto", "osea", "sea", "bueno", "pues", "digamos",
-  "berdad", "ok", "okey", "aja", "ya",
-]);
+/** Muletillas: si no empatan, casi no cuestan. Formas plegadas. */
+const FILLERS = new Set(["e", "em", "m", "a", "este", "esto", "osea", "sea", "bueno", "pues", "digamos", "berdad", "ok", "okey", "aja", "ya", "mm", "eee"]);
 
-type Match = { j: number; score: number };
+/** Palabras funcionales: empatan, pero casi no pesan (no sirven para ubicarte). */
+const STOP = new Set(
+  [
+    "y", "e", "o", "u", "a", "de", "del", "al", "la", "el", "los", "las", "lo", "le", "les", "un", "una", "unos", "unas",
+    "que", "en", "con", "por", "para", "se", "su", "sus", "mi", "mis", "tu", "me", "te", "nos", "es", "no", "si", "ya",
+    "muy", "mas", "pero", "como", "the", "and", "of", "to", "in", "is", "it",
+  ].map(fold),
+);
 
-function penalty(d: number): number {
-  return d > 0 ? d * PARAMS.FWD_PEN : -d * PARAMS.BACK_PEN;
+/** Peso de una unidad del guion: cuánto te ubica haberla dicho. */
+function weight(f: string): number {
+  if (STOP.has(f)) return 0.3;
+  if (f.length <= 3) return 0.55;
+  return Math.min(1.4, 0.5 + 0.12 * f.length);
 }
 
-function lookahead(script: Script, j: number, nxt: string | undefined): boolean {
-  if (!nxt) return false;
-  const units = script.units;
-  if (j + 1 < units.length && similarity(nxt, units[j + 1].fold) >= 0.8) return true;
-  if (j + 2 < units.length && similarity(nxt, units[j + 2].fold) >= 0.8) return true;
-  return false;
+/** Costo de saltarse k unidades del guion. */
+function gapCost(k: number): number {
+  if (k <= 0) return 0;
+  if (k <= 3) return 0.3 * k;
+  return Math.min(4, 0.9 + 0.12 * (k - 3));
 }
 
-/** Empata `w` contra una unidad en la ventana [cur-back, cur+1+ahead]. */
-function scan(script: Script, cur: number, w: string, nxt: string | undefined, back: number, ahead: number): Match | null {
-  const units = script.units;
-  const lo = Math.max(0, cur - back);
-  const hi = Math.min(units.length - 1, cur + 1 + ahead);
-  let best: Match | null = null;
-  for (let j = lo; j <= hi; j++) {
-    const uf = units[j].fold;
-    const s = similarity(w, uf);
-    if (s < threshold(uf.length)) continue;
-    const d = j - (cur + 1);
-    const la = lookahead(script, j, nxt);
-    // palabras cortas ("de", "la"): solo la esperada, la siguiente, o con confirmación
-    if (uf.length <= 3 && !la && (d < 0 || d > 1)) continue;
-    let score = s - penalty(d) + (d === 0 ? PARAMS.EXPECTED_BONUS : 0);
-    if (la) score += PARAMS.LOOKAHEAD_BONUS;
-    if (score >= PARAMS.ACCEPT && (!best || score > best.score)) best = { j, score };
-  }
-  return best;
+/** Costo de volver k unidades atrás (releer). */
+function backCost(k: number): number {
+  return 1.1 + 0.1 * k;
 }
 
-/** Empata `w` contra DOS unidades consecutivas ("porque" ↔ "por qué"). Devuelve la 2ª. */
-function scanPair(script: Script, cur: number, w: string, back: number, ahead: number): Match | null {
-  if (w.length < 5) return null;
-  const units = script.units;
-  const lo = Math.max(0, cur - back);
-  const hi = Math.min(units.length - 2, cur + 1 + ahead);
-  let best: Match | null = null;
-  for (let j = lo; j <= hi; j++) {
-    const pair = units[j].fold + units[j + 1].fold;
-    const s = similarity(w, pair);
-    if (s < threshold(pair.length)) continue;
-    const d = j - (cur + 1);
-    const score = s - penalty(d) + (d === 0 ? PARAMS.EXPECTED_BONUS : 0);
-    if (score >= PARAMS.ACCEPT && (!best || score > best.score)) best = { j: j + 1, score };
-  }
-  return best;
+function insCost(w: string): number {
+  return FILLERS.has(w) ? 0.08 : 0.45;
+}
+
+/** Similitud que respeta el umbral de la unidad; 0 = no empata. */
+function sim(w: string, uf: string): number {
+  const s = similarity(w, uf);
+  return s >= threshold(uf.length) ? s : 0;
 }
 
 /**
- * Re-sincronización cuando estamos perdidos: busca las últimas K palabras
- * como secuencia. Devuelve la unidad final del ancla o null.
+ * Re-sincronización cuando no hay empates en la ventana: busca las últimas
+ * K palabras como secuencia en todo el guion. Devuelve la unidad final o null.
  */
-function findAnchor(script: Script, cur: number, lastK: string[], wide: boolean): number | null {
+function findAnchor(script: Script, cur: number, lastK: string[]): number | null {
   const units = script.units;
   const K = lastK.length;
   if (K < 2 || units.length < K) return null;
-  const from = wide ? 0 : Math.max(0, cur - 20);
-  const to = wide ? units.length - K : Math.min(units.length - K, cur + 30);
   let best: { j: number; score: number } | null = null;
-  for (let j = from; j <= to; j++) {
+  for (let j = 0; j <= units.length - K; j++) {
     let hits = 0;
     let hasLong = false;
     for (let k = 0; k < K; k++) {
       const uf = units[j + k].fold;
       if (similarity(lastK[k], uf) >= 0.8) {
         hits++;
-        if (uf.length >= 4) hasLong = true;
+        if (uf.length >= 4 && !STOP.has(uf)) hasLong = true;
       }
     }
     if (hits < PARAMS.ANCHOR_MIN || !hasLong) continue;
@@ -131,6 +127,131 @@ function findAnchor(script: Script, cur: number, lastK: string[], wide: boolean)
     if (!best || score > best.score) best = { j, score };
   }
   return best ? best.j + K - 1 : null;
+}
+
+type Step = { i: number; q: number };
+
+/** Mejor alineación de las palabras `W` desde el cursor `c`. */
+function alignWindow(script: Script, c: number, W: string[]) {
+  const units = script.units;
+  const N = units.length;
+  const n = W.length;
+  const L = Math.max(-1, c - PARAMS.BACK);
+  const R = Math.min(N - 1, c + 1 + PARAMS.AHEAD + Math.ceil(n * 1.3));
+  const S = R - L + 1; // estados: cursor en L..R
+  const idx = (p: number) => p - L;
+
+  // similitudes precalculadas (palabra i × unidad q): Levenshtein una sola vez
+  const simW = new Float32Array(n * S);
+  const simPair = new Float32Array(n * S); // W[i] ≈ unidades q-1+q ("porque" ↔ "por qué")
+  const simMerge = new Float32Array(n * S); // W[i-1]+W[i] ≈ unidad q ("a ver" ↔ "haber")
+  for (let i = 0; i < n; i++) {
+    for (let q = Math.max(0, L); q <= R; q++) {
+      const uf = units[q].fold;
+      simW[i * S + idx(q)] = sim(W[i], uf);
+      if (q - 1 >= 0 && W[i].length >= 5) {
+        const pair = units[q - 1].fold + uf;
+        const s = similarity(W[i], pair);
+        simPair[i * S + idx(q)] = s >= threshold(pair.length) ? s : 0;
+      }
+      if (i >= 1) simMerge[i * S + idx(q)] = sim(W[i - 1] + W[i], uf);
+    }
+  }
+  const wq = new Float32Array(S);
+  for (let q = Math.max(0, L); q <= R; q++) wq[idx(q)] = weight(units[q].fold);
+
+  const NEG = -1e9;
+  const D = new Float64Array((n + 1) * S).fill(NEG);
+  // padre de cada estado: fila y columna previas (para reconstruir el camino)
+  const parRow = new Int16Array((n + 1) * S).fill(-1);
+  const parCol = new Int32Array((n + 1) * S).fill(-1);
+  const isMatch = new Uint8Array((n + 1) * S);
+  D[idx(c)] = 0;
+
+  const relax = (row: number, q: number, val: number, pr: number, pc: number, match: boolean) => {
+    const k = row * S + idx(q);
+    if (val > D[k]) {
+      D[k] = val;
+      parRow[k] = pr;
+      parCol[k] = pc;
+      isMatch[k] = match ? 1 : 0;
+    }
+  };
+
+  for (let i = 1; i <= n; i++) {
+    const w = W[i - 1];
+    const prev = (i - 1) * S;
+    let rowBest = NEG;
+    for (let p = L; p <= R; p++) rowBest = Math.max(rowBest, D[prev + idx(p)]);
+    let bestP = c;
+    for (let p = L; p <= R; p++) if (D[prev + idx(p)] === rowBest) bestP = p;
+
+    for (let p = L; p <= R; p++) {
+      const base = D[prev + idx(p)];
+      if (base <= NEG / 2 || base < rowBest - PARAMS.BEAM) continue;
+      // palabra que no está en el guion (o el reconocedor la inventó)
+      relax(i, p, base - insCost(w), i - 1, p, false);
+      // empate hacia adelante, saltándose hasta MAX_GAP unidades
+      const hiQ = Math.min(R, p + 1 + PARAMS.MAX_GAP);
+      for (let q = Math.max(0, p + 1); q <= hiQ; q++) {
+        const sv = simW[(i - 1) * S + idx(q)];
+        if (sv > 0) relax(i, q, base + wq[idx(q)] * sv - gapCost(q - p - 1), i - 1, p, true);
+        // una palabra = dos del guion, solo si la primera sola NO empata
+        // (si no, "presupuesto" se estiraría a "presupuesto y")
+        const sp = simPair[(i - 1) * S + idx(q)];
+        if (sp > 0 && q - 1 >= p + 1 && simW[(i - 1) * S + idx(q - 1)] === 0)
+          relax(i, q, base + Math.max(wq[idx(q)], wq[idx(q - 1)]) * sp * 1.4 - gapCost(q - 1 - p - 1), i - 1, p, true);
+      }
+      // releer: empate hacia atrás (te devolviste unas palabras)
+      for (let q = Math.max(0, L, p - PARAMS.BACK); q <= p; q++) {
+        const sv = simW[(i - 1) * S + idx(q)];
+        if (sv > 0 && wq[idx(q)] > 0.3) relax(i, q, base + wq[idx(q)] * sv - backCost(p - q + 1), i - 1, p, true);
+      }
+      // dos palabras dichas = una del guion
+      if (i >= 2) {
+        const b2 = D[(i - 2) * S + idx(p)];
+        if (b2 > NEG / 2) {
+          for (let q = Math.max(0, p + 1); q <= hiQ; q++) {
+            const sm = simMerge[(i - 1) * S + idx(q)];
+            if (sm > 0) relax(i, q, b2 + wq[idx(q)] * sm * 1.2 - gapCost(q - p - 1), i - 2, p, true);
+          }
+        }
+      }
+    }
+    // salto largo (otro párrafo dentro de la ventana): solo desde el mejor estado
+    const base = D[prev + idx(bestP)];
+    for (let q = Math.max(0, bestP + PARAMS.MAX_GAP + 2); q <= R; q++) {
+      const sv = simW[(i - 1) * S + idx(q)];
+      if (sv > 0 && wq[idx(q)] > 0.3) relax(i, q, base + wq[idx(q)] * sv - gapCost(q - bestP - 1), i - 1, bestP, true);
+    }
+  }
+
+  // mejor final; en empate, el más adelantado
+  let end = c;
+  let best = NEG;
+  for (let p = L; p <= R; p++) {
+    const v = D[n * S + idx(p)];
+    if (v > best || (v === best && p > end)) {
+      best = v;
+      end = p;
+    }
+  }
+
+  // reconstruir empates
+  const steps: Step[] = [];
+  let row = n;
+  let col = end;
+  while (row > 0) {
+    const k = row * S + idx(col);
+    if (isMatch[k]) steps.push({ i: row - 1, q: col });
+    const pr = parRow[k];
+    const pc = parCol[k];
+    if (pr < 0) break;
+    row = pr;
+    col = pc;
+  }
+  steps.reverse();
+  return { end, steps };
 }
 
 /**
@@ -152,43 +273,38 @@ export function advanceCursor(
     return isFinal ? { ...state, lastFinalKey: key } : state;
   }
 
-  let cur = state.committed;
-  let miss = state.missStreak;
+  const c = state.committed;
+  let { end, steps } = alignWindow(script, c, W);
+  let jump: AlignJump | null = null;
 
-  for (let i = 0; i < W.length; i++) {
-    const w = W[i];
-    const nxt = W[i + 1];
-    const ahead = miss >= 3 ? PARAMS.AHEAD_LOST : PARAMS.AHEAD;
+  // salto detectado: el primer empate lejos del cursor, o un hueco grande entre empates
+  let prevQ = c;
+  for (const st of steps) {
+    const d = st.q - prevQ;
+    if (d - 1 >= PARAMS.JUMP_NOTICE && (!jump || d > jump.to - jump.from)) jump = { from: prevQ, to: st.q, dir: "ahead" };
+    if (d <= -3) jump = { from: prevQ, to: st.q, dir: "back" };
+    prevQ = st.q;
+  }
 
-    let best = scan(script, cur, w, nxt, PARAMS.BACK, ahead);
-    if (!best && nxt !== undefined) {
-      // "a ver" ↔ "haber": dos palabras dichas = una del guion
-      const b2 = scan(script, cur, w + nxt, W[i + 2], PARAMS.BACK, ahead);
-      if (b2) {
-        best = b2;
-        i++;
-      }
-    }
-    if (!best) best = scanPair(script, cur, w, PARAMS.BACK, ahead);
+  // palabras finales sin empate (improvisas, o te fuiste a otro lado)
+  const lastMatchedWord = steps.length ? steps[steps.length - 1].i : -1;
+  let miss = 0;
+  for (let i = lastMatchedWord + 1; i < W.length; i++) if (!FILLERS.has(W[i])) miss++;
+  if (!steps.length) miss += state.missStreak;
 
-    if (best) {
-      cur = best.j;
+  // fuera de la ventana: buscar la frase por ancla en todo el guion
+  if (miss >= 3 && W.length >= 3) {
+    const a = findAnchor(script, end, W.slice(-PARAMS.ANCHOR_K));
+    if (a !== null && a !== end) {
+      jump = { from: end, to: a, dir: a > end ? "ahead" : "back" };
+      end = a;
       miss = 0;
-      continue;
-    }
-    if (FILLERS.has(w)) continue;
-    miss++;
-    if (miss >= 3 && i >= 2) {
-      const a = findAnchor(script, cur, W.slice(i - 2, i + 1), miss >= 6);
-      if (a !== null) {
-        cur = a;
-        miss = 0;
-      }
+      steps = [];
     }
   }
 
-  if (isFinal) return { committed: cur, provisional: cur, missStreak: miss, lastFinalKey: key };
-  return { ...state, provisional: cur };
+  if (isFinal) return { committed: end, provisional: end, missStreak: miss, lastFinalKey: key, jump };
+  return { ...state, provisional: end, jump };
 }
 
 /** Reposiciona el cursor en el primer token alineable a partir de `tokenIdx`. */
@@ -201,14 +317,14 @@ export function setCursorToToken(script: Script, tokenIdx: number): AlignState {
       break;
     }
   }
-  return { committed: u, provisional: u, missStreak: 0, lastFinalKey: "" };
+  return { committed: u, provisional: u, missStreak: 0, lastFinalKey: "", jump: null };
 }
 
 /** Mueve el cursor `delta` unidades (atajos de teclado). */
 export function nudgeCursor(script: Script, state: AlignState, delta: number): AlignState {
   const N = script.units.length;
   const u = Math.max(-1, Math.min(N - 1, state.committed + delta));
-  return { committed: u, provisional: u, missStreak: 0, lastFinalKey: "" };
+  return { committed: u, provisional: u, missStreak: 0, lastFinalKey: "", jump: null };
 }
 
 /** Token del guion que corresponde a una unidad (-1 si ninguna). */

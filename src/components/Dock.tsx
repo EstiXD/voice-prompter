@@ -1,6 +1,6 @@
 "use client";
 
-import { IconCollapse, IconEar, IconExpand, IconMic, IconPause, IconPlay, IconSliders, IconStop, IconEdit } from "./icons";
+import { IconCamera, IconCollapse, IconEar, IconEdit, IconExpand, IconImage, IconMic, IconPause, IconPlay, IconSliders, IconStop } from "./icons";
 import { VuMeter } from "./VuMeter";
 import { formatDuration } from "@/lib/audio/download";
 import type { SpeechStatus } from "@/hooks/useSpeechRecognition";
@@ -15,6 +15,10 @@ type Props = {
   speechStatus: SpeechStatus;
   speechSupported: boolean;
   usingTrack: boolean;
+  usingLocal: boolean;
+  mode: "audio" | "video";
+  /** modo cámara: abrir "Fondo y luz" */
+  onLook?: () => void;
   lang: string;
   onLang: (code: string) => void;
   rnnoise: boolean;
@@ -31,11 +35,11 @@ type Props = {
   hidden?: boolean;
 };
 
-function speechLabel(status: SpeechStatus, supported: boolean, usingTrack: boolean): { text: string; tone: "ok" | "warn" | "off" } {
+function speechLabel(status: SpeechStatus, supported: boolean, usingTrack: boolean, usingLocal: boolean): { text: string; tone: "ok" | "warn" | "off" } {
   if (!supported) return { text: "Sin reconocimiento", tone: "off" };
   switch (status) {
     case "listening":
-      return { text: usingTrack ? "Escuchando · audio limpio" : "Escuchando", tone: "ok" };
+      return { text: usingLocal ? "Te sigo · en tu equipo" : usingTrack ? "Te sigo · audio limpio" : "Te sigo", tone: "ok" };
     case "starting":
       return { text: "Conectando…", tone: "warn" };
     case "error":
@@ -49,7 +53,8 @@ export function Dock(p: Props) {
   const live = p.phase === "recording";
   const paused = p.phase === "paused";
   const idle = p.phase === "ready" || p.phase === "starting";
-  const sp = speechLabel(p.speechStatus, p.speechSupported, p.usingTrack);
+  const sp = speechLabel(p.speechStatus, p.speechSupported, p.usingTrack, p.usingLocal);
+  const RecIcon = p.mode === "video" ? IconCamera : IconMic;
 
   return (
     <div
@@ -63,10 +68,10 @@ export function Dock(p: Props) {
             className="rec-btn"
             onClick={p.onRecord}
             disabled={p.phase === "starting"}
-            aria-label="Grabar"
-            title="Grabar (Espacio)"
+            aria-label={p.mode === "video" ? "Grabar video" : "Grabar voz"}
+            title={p.mode === "video" ? "Grabar video (Espacio)" : "Grabar voz (Espacio)"}
           >
-            <IconMic className="h-6 w-6" />
+            <RecIcon className="h-6 w-6" />
           </button>
         ) : (
           <button type="button" className="rec-btn" data-live="true" onClick={p.onStop} aria-label="Detener" title="Detener">
@@ -78,7 +83,7 @@ export function Dock(p: Props) {
         <div className="flex min-w-[7.5rem] flex-col gap-0.5">
           <span className="onair" data-live={live ? "true" : paused ? "paused" : "false"}>
             <span className="onair-dot" />
-            {live ? "On air" : paused ? "Pausa" : p.phase === "starting" ? "Iniciando" : "Listo"}
+            {live ? (p.mode === "video" ? "Rec" : "On air") : paused ? "Pausa" : p.phase === "starting" ? "Iniciando" : "Listo"}
           </span>
           <span className="timer" aria-live="off">{formatDuration(p.elapsedMs)}</span>
         </div>
@@ -137,6 +142,12 @@ export function Dock(p: Props) {
 
         <div className="dock-sep hidden sm:block" />
 
+        {p.mode === "video" && p.onLook && (
+          <button type="button" className="btn btn-ghost h-10 gap-1.5 px-3" onClick={p.onLook} aria-label="Fondo y luz" title="Fondo, luz y mirada">
+            <IconImage className="h-5 w-5" />
+            <span className="hidden text-xs lg:inline">Fondo y luz</span>
+          </button>
+        )}
         {idle && (
           <button type="button" className="btn btn-ghost btn-icon" onClick={p.onEdit} aria-label="Editar guion" title="Editar guion">
             <IconEdit className="h-5 w-5" />

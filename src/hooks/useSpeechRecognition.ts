@@ -11,8 +11,10 @@ export type SpeechOptions = {
   onWords: (text: string, isFinal: boolean) => void;
   /** palabras a favorecer (Chrome 139+, solo con processLocally) */
   phrases?: string[];
-  /** reconocimiento en el dispositivo (experimental) */
+  /** reconocimiento en el dispositivo (Chrome 139+): menos latencia, sin nube */
   processLocally?: boolean;
+  /** el modo local falló en esta sesión y se cayó a la nube */
+  onLocalFallback?: () => void;
 };
 
 const FATAL: ReadonlySet<string> = new Set(["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported", "bad-grammar"]);
@@ -60,6 +62,8 @@ export function useSpeechRecognition(opts: SpeechOptions) {
   const lastErrorRef = useRef<string | null>(null);
   const startInternalRef = useRef<() => void>(() => {});
   const phrasesUnsupportedRef = useRef(false);
+  const localFailedRef = useRef(false);
+  const [usingLocal, setUsingLocal] = useState(false);
 
   const clearRestart = () => {
     if (restartTimerRef.current !== null) {
@@ -84,24 +88,26 @@ export function useSpeechRecognition(opts: SpeechOptions) {
     rec.interimResults = true;
     rec.maxAlternatives = 1;
 
-    // Sesgo contextual: Chrome solo lo acepta con reconocimiento en el
-    // dispositivo (processLocally); en la nube responde "phrases-not-supported"
-    // y cierra la sesión. Solo se aplica si el usuario pidió modo local.
-    const phrases = optsRef.current.phrases;
-    if (
-      optsRef.current.processLocally &&
-      !phrasesUnsupportedRef.current &&
-      phrases?.length &&
-      "phrases" in rec &&
-      typeof window.SpeechRecognitionPhrase === "function"
-    ) {
+    // En el dispositivo: el modelo corre local y los interinos llegan antes.
+    // Sesgo contextual: Chrome solo lo acepta en ese modo; en la nube responde
+    // "phrases-not-supported" y cierra la sesión.
+    const local = !!optsRef.current.processLocally && !localFailedRef.current && "processLocally" in rec;
+    if (local) {
       try {
         rec.processLocally = true;
-        rec.phrases = phrases.map((p) => new SpeechRecognitionPhrase(p, 2));
       } catch {
         /* experimental: ignorar */
       }
+      const phrases = optsRef.current.phrases;
+      if (!phrasesUnsupportedRef.current && phrases?.length && "phrases" in rec && typeof window.SpeechRecognitionPhrase === "function") {
+        try {
+          rec.phrases = phrases.map((p) => new SpeechRecognitionPhrase(p, 2));
+        } catch {
+          /* experimental: ignorar */
+        }
+      }
     }
+    setUsingLocal(local);
 
     lastFinalRef.current = -1;
     gotResultsRef.current = false;
@@ -140,6 +146,13 @@ export function useSpeechRecognition(opts: SpeechOptions) {
         phrasesUnsupportedRef.current = true;
         return; // onend reinicia sin phrases
       }
+      // El paquete de idioma local no está (o el modo local no aplica aquí):
+      // seguimos en la nube en vez de cortar la toma.
+      if (local && (code === "language-not-supported" || code === "service-not-allowed")) {
+        localFailedRef.current = true;
+        optsRef.current.onLocalFallback?.();
+        return; // onend reinicia en la nube
+      }
       if (FATAL.has(code)) {
         activeRef.current = false;
         setError(describeSpeechError(code));
@@ -163,11 +176,14 @@ export function useSpeechRecognition(opts: SpeechOptions) {
         trackFailedRef.current = true;
         setUsingTrack(false);
       }
-      // Guardia contra bucles: >8 reinicios en 10 s → esperar más.
+      // Chrome corta la sesión sola (silencio, ~60 s): reanudar YA, sin hueco
+      // en el que se pierdan palabras. Tras un error de red se espera un poco,
+      // y la guardia contra bucles (>8 reinicios en 10 s) espera más.
       const now = Date.now();
       restartTimesRef.current = restartTimesRef.current.filter((t) => now - t < 10_000);
       restartTimesRef.current.push(now);
-      const delay = restartTimesRef.current.length > 8 ? 1500 : 250;
+      const err = lastErrorRef.current;
+      const delay = restartTimesRef.current.length > 8 ? 1500 : err && err !== "no-speech" && err !== "aborted" ? 250 : 0;
       clearRestart();
       restartTimerRef.current = window.setTimeout(() => {
         restartTimerRef.current = null;
@@ -208,6 +224,7 @@ export function useSpeechRecognition(opts: SpeechOptions) {
       clearRestart();
       trackRef.current = track;
       trackFailedRef.current = false;
+      localFailedRef.current = false;
       restartTimesRef.current = [];
       activeRef.current = true;
       setError(null);
@@ -236,5 +253,5 @@ export function useSpeechRecognition(opts: SpeechOptions) {
 
   useEffect(() => () => stop(), [stop]);
 
-  return { status, error, usingTrack, start, stop };
+  return { status, error, usingTrack, usingLocal, start, stop };
 }

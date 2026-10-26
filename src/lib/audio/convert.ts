@@ -2,8 +2,8 @@
 // Usa mediabunny (WebCodecs + muxers) y, si el navegador no trae el códec,
 // los encoders WASM de @mediabunny/* (se cargan bajo demanda).
 
-import type { ExportFormat } from "./formats";
-import { formatInfo } from "./formats";
+import type { ExportFormat, VideoExportFormat } from "./formats";
+import { formatInfo, videoFormatInfo } from "./formats";
 import { blobToWav } from "./wav";
 
 export type ConvertResult = { blob: Blob; ext: string; mime: string };
@@ -84,6 +84,8 @@ async function convertWithMediabunny(blob: Blob, format: Exclude<ExportFormat, "
     output,
     // voz: siempre mono (por si la toma llegó estéreo)
     audio: { ...audio, numberOfChannels: 1 },
+    // si la toma es un video, aquí solo interesa la voz
+    video: { discard: true },
     showWarnings: false,
   });
   if (!conversion.isValid) {
@@ -94,4 +96,51 @@ async function convertWithMediabunny(blob: Blob, format: Exclude<ExportFormat, "
   const buffer = target.buffer;
   if (!buffer || buffer.byteLength === 0) throw new Error("La conversión no produjo datos");
   return buffer;
+}
+
+/**
+ * Video grabado → MP4 / WebM (o solo la voz en WAV / MP3). Si la toma ya está
+ * en el contenedor y códec pedidos, se remultiplexa sin recodificar: es casi
+ * instantáneo y no pierde calidad (el MP4 de MediaRecorder es fragmentado y
+ * así queda como MP4 normal, con el índice al principio).
+ */
+export async function convertVideo(blob: Blob, format: VideoExportFormat, onProgress?: (f: number) => void): Promise<ConvertResult> {
+  const info = videoFormatInfo(format);
+  if (format === "wav" || format === "mp3") {
+    const out = await convertRecording(blob, format, { originalExt: "", onProgress });
+    return out;
+  }
+  try {
+    const mb = await import("mediabunny");
+    const input = new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
+    const target = new mb.BufferTarget();
+    let outputFormat: InstanceType<typeof mb.OutputFormat>;
+    let video: { codec: (typeof mb.VIDEO_CODECS)[number]; bitrate: InstanceType<typeof mb.Quality> };
+    let audio: { codec: (typeof mb.AUDIO_CODECS)[number]; bitrate: number };
+    if (format === "mp4") {
+      if (!(await mb.canEncodeAudio("aac"))) (await import("@mediabunny/aac-encoder")).registerAacEncoder();
+      outputFormat = new mb.Mp4OutputFormat({ fastStart: "in-memory" });
+      video = { codec: "avc", bitrate: mb.QUALITY_VERY_HIGH };
+      audio = { codec: "aac", bitrate: 160_000 };
+    } else {
+      outputFormat = new mb.WebMOutputFormat();
+      video = { codec: "vp9", bitrate: mb.QUALITY_VERY_HIGH };
+      audio = { codec: "opus", bitrate: 128_000 };
+    }
+    const output = new mb.Output({ format: outputFormat, target });
+    const conversion = await mb.Conversion.init({ input, output, video, audio, showWarnings: false });
+    if (!conversion.isValid) {
+      throw new Error(`Conversión inválida: ${conversion.discardedTracks.map((t) => t.reason).join(", ") || "sin pistas"}`);
+    }
+    conversion.onProgress = (p) => onProgress?.(Math.max(0, Math.min(1, p)));
+    await conversion.execute();
+    const buffer = target.buffer;
+    if (!buffer || buffer.byteLength === 0) throw new Error("La conversión no produjo datos");
+    return { blob: new Blob([buffer], { type: info.mime }), ext: info.ext, mime: info.mime };
+  } catch (err) {
+    console.warn(`[convert] video → ${format} falló:`, err);
+    // Respaldo: si la toma ya venía en ese contenedor, entregarla tal cual.
+    if (blob.type.includes(format)) return { blob, ext: info.ext, mime: blob.type };
+    throw new ConvertError(`No pude convertir el video a ${info.label} en este navegador. Prueba el otro formato.`, err);
+  }
 }

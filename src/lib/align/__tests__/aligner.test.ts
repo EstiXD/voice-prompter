@@ -220,3 +220,75 @@ describe("advanceCursor", () => {
     expect(normalizeTranscript("  ")).toEqual([]);
   });
 });
+
+describe("alineación robusta (palabras cortas repetidas, saltos)", () => {
+  const S = "Hola, soy Estiven y les vengo a explicar y esto es muy bueno para todos.";
+  const script = tokenizeScript(S);
+  const at = (st: AlignState) => script.tokens[tokenOfUnit(script, st.provisional >= 0 ? st.provisional : st.committed)]?.raw;
+  /** Interinos crecientes palabra a palabra, como los manda Chrome. */
+  function interims(text: string, from: AlignState = INITIAL_STATE) {
+    const words = text.split(" ");
+    let st = from;
+    const seen: string[] = [];
+    const pos: number[] = [];
+    for (let k = 1; k <= words.length; k++) {
+      st = advanceCursor(script, { ...st, provisional: st.committed }, words.slice(0, k).join(" "), false);
+      seen.push(at(st) ?? "");
+      pos.push(st.provisional);
+    }
+    return { st, seen, pos };
+  }
+
+  it("la primera «y» no salta a la segunda", () => {
+    const { seen } = interims("hola soy estiven y");
+    expect(seen.at(-1)).toBe("y");
+    expect(tokenOfUnit(script, advanceCursor(script, INITIAL_STATE, "hola soy estiven y", false).provisional)).toBe(3);
+  });
+
+  it("nombre mal reconocido o comido: sigue en la «y» correcta", () => {
+    expect(tokenOfUnit(script, advanceCursor(script, INITIAL_STATE, "hola soy esteban y", false).provisional)).toBe(3);
+    expect(tokenOfUnit(script, advanceCursor(script, INITIAL_STATE, "hola soy y", false).provisional)).toBe(3);
+  });
+
+  it("«y» sueltas de más no arrastran el cursor", () => {
+    expect(tokenOfUnit(script, advanceCursor(script, INITIAL_STATE, "hola soy estiven y y y", false).provisional)).toBe(3);
+  });
+
+  it("la segunda «y» se reconoce en su sitio", () => {
+    const { seen } = interims("hola soy estiven y les vengo a explicar y esto");
+    expect(seen).toEqual(["Hola,", "soy", "Estiven", "y", "les", "vengo", "a", "explicar", "y", "esto"]);
+  });
+
+  it("el cursor nunca retrocede mientras lees de corrido", () => {
+    const { seen, pos } = interims("hola soy estiven y les vengo a explicar y esto es muy bueno para todos");
+    for (let k = 1; k < pos.length; k++) expect(pos[k]).toBeGreaterThan(pos[k - 1]);
+    expect(seen.at(-1)).toBe("todos.");
+  });
+
+  it("el reconocedor se come palabras: igual llega", () => {
+    const st = advanceCursor(script, INITIAL_STATE, "hola estiven les vengo explicar esto es muy bueno", true);
+    expect(script.tokens[tokenOfUnit(script, st.committed)].raw).toBe("bueno");
+  });
+
+  it("avisa cuando te saltas un trozo, no en lectura normal", () => {
+    const long = tokenizeScript(
+      "Primero revisaremos las ventas del trimestre anterior con todo el equipo comercial. " +
+        "Después analizaremos el presupuesto de marketing para el próximo año fiscal.",
+    );
+    const normal = advanceCursor(long, INITIAL_STATE, "primero revisaremos las ventas del trimestre", true);
+    expect(normal.jump ?? null).toBeNull();
+    const skipped = advanceCursor(long, normal, "despues analizaremos el presupuesto", true);
+    expect(skipped.jump?.dir).toBe("ahead");
+    expect(long.tokens[tokenOfUnit(long, skipped.committed)].raw).toBe("presupuesto");
+  });
+
+  it("un interino largo (monólogo sin pausas) se alinea rápido", () => {
+    const words = Array.from({ length: 120 }, (_, i) => ["la", "casa", "de", "maria", "tiene", "un", "jardin", "enorme", "y", "luminoso"][i % 10]);
+    const big = tokenizeScript(words.join(" "));
+    const t0 = performance.now();
+    const st = advanceCursor(big, INITIAL_STATE, words.slice(0, 100).join(" "), false);
+    const ms = performance.now() - t0;
+    expect(st.provisional).toBe(99);
+    expect(ms).toBeLessThan(60);
+  });
+});

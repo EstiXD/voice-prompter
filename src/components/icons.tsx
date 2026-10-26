@@ -157,3 +157,88 @@ export const IconSparkle = (p: IconProps) => (
     <path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2" />
   </svg>
 );
+
+export const IconCamera = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="6.5" width="13" height="11" rx="2.5" />
+    <path d="m16 10.5 5-3v9l-5-3z" />
+  </svg>
+);
+
+export const IconEye = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
+export const IconImage = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+    <circle cx="9" cy="10" r="1.6" />
+    <path d="m4 17 5-4.5 4 3.5 2.5-2 4.5 3.5" />
+  </svg>
+);
+
+export const IconSun = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" />
+  </svg>
+);
+
+export const IconUpload = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 16V5" />
+    <path d="m7 9.5 5-5 5 5" />
+    <path d="M4 19h16" />
+  </svg>
+);
+
+export const IconGrip = (p: IconProps) => (
+  <svg {...base(p)}>
+    {[8, 12, 16].map((x) => [9, 15].map((y) => <circle key={`${x}-${y}`} cx={x} cy={y} r="1.1" fill="currentColor" stroke="none" />))}
+  </svg>
+);
+
+export const IconHelp = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M9.6 9.3a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.2-2.4 3.8" />
+    <circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none" />
+  </svg>
+);
+
+export const IconPlus = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 5v14M5 12h14" />
+  </svg>
+);
+
+export const IconMinus = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 12h14" />
+  </svg>
+);
+
+export const IconResize = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M20 13v7h-7M20 20l-6-6M4 11V4h7M4 4l6 6" />
+  </svg>
+);
+
+export const IconBlur = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="8.5" strokeDasharray="1.5 2.5" />
+    <circle cx="12" cy="12" r="4.5" />
+  </svg>
+);
+
+export const IconFace = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="8.5" />
+    <circle cx="9" cy="10.5" r="0.9" fill="currentColor" stroke="none" />
+    <circle cx="15" cy="10.5" r="0.9" fill="currentColor" stroke="none" />
+    <path d="M8.8 14.6a4.2 4.2 0 0 0 6.4 0" />
+  </svg>
+);

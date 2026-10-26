@@ -5,8 +5,9 @@ import { IconX } from "./icons";
 import { LANGS } from "@/lib/speech/langs";
 import { EXPORT_FORMATS } from "@/lib/audio/formats";
 import type { PrompterSettings } from "@/lib/persist";
-import type { MicDevice } from "@/hooks/useMediaDevices";
+import type { CameraDevice, MicDevice } from "@/hooks/useMediaDevices";
 import type { Support } from "@/lib/speech/support";
+import type { OnDeviceState } from "@/lib/speech/ondevice";
 
 type Props = {
   open: boolean;
@@ -18,7 +19,25 @@ type Props = {
   /** grabando: algunos ajustes no se pueden cambiar en caliente */
   locked: boolean;
   rnnoiseActive: boolean;
+  cameras: CameraDevice[];
+  onDevice: OnDeviceState;
+  onInstallOnDevice: () => void;
 };
+
+function onDeviceHint(st: OnDeviceState): string {
+  switch (st) {
+    case "available":
+      return "Listo: el reconocimiento corre en tu equipo y el texto te sigue más rápido.";
+    case "downloadable":
+      return "Descarga el idioma una vez (unos cientos de MB) para que el texto te siga más rápido.";
+    case "downloading":
+      return "Descargando el idioma… mientras tanto se usa la nube.";
+    case "unavailable":
+      return "Este idioma no se puede reconocer en el equipo aquí; se usa la nube.";
+    default:
+      return "Requiere Chrome o Edge 139+. Aquí se usa la nube.";
+  }
+}
 
 function Switch({ checked, onChange, disabled, id }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; id: string }) {
   return (
@@ -60,7 +79,7 @@ function Slider({
   );
 }
 
-export function SettingsPanel({ open, onClose, settings, onChange, devices, support, locked, rnnoiseActive }: Props) {
+export function SettingsPanel({ open, onClose, settings, onChange, devices, support, locked, rnnoiseActive, cameras, onDevice, onInstallOnDevice }: Props) {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -83,6 +102,7 @@ export function SettingsPanel({ open, onClose, settings, onChange, devices, supp
         aria-modal="true"
         aria-label="Ajustes"
         aria-hidden={!open}
+        inert={!open}
       >
         <header className="flex items-center justify-between border-b border-line px-5 py-4">
           <h2 className="font-display text-xl italic">Ajustes</h2>
@@ -158,6 +178,14 @@ export function SettingsPanel({ open, onClose, settings, onChange, devices, supp
                 ))}
               </select>
             </div>
+            <Row label="Reconocer en tu equipo" hint={onDeviceHint(onDevice)} htmlFor="ondevice">
+              <Switch id="ondevice" checked={settings.onDevice} onChange={(v) => onChange({ onDevice: v })} disabled={onDevice === "unsupported" || onDevice === "unavailable" || locked} />
+            </Row>
+            {settings.onDevice && onDevice === "downloadable" && (
+              <button type="button" className="btn mb-2 w-full" onClick={onInstallOnDevice}>
+                Descargar idioma para seguirte más rápido
+              </button>
+            )}
             <Row
               label="Reconocer el audio ya limpio"
               hint={
@@ -168,6 +196,31 @@ export function SettingsPanel({ open, onClose, settings, onChange, devices, supp
               htmlFor="procrec"
             >
               <Switch id="procrec" checked={settings.recognizeProcessed} onChange={(v) => onChange({ recognizeProcessed: v })} disabled={!support?.trackInput || locked} />
+            </Row>
+          </section>
+
+          <section className="mt-2 border-t border-line pt-4">
+            <p className="label mb-1">Cámara</p>
+            <div className="py-3">
+              <label htmlFor="cam" className="mb-2 block text-sm font-semibold text-paper">Cámara</label>
+              <select id="cam" className="field w-full" value={settings.cameraId} onChange={(e) => onChange({ cameraId: e.target.value })} disabled={locked}>
+                <option value="">Predeterminada del sistema</option>
+                {cameras.map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>{d.label}</option>
+                ))}
+              </select>
+            </div>
+            <Row label="Vista previa en espejo" hint="Te ves como en un espejo; el video se graba al derecho." htmlFor="mirrorprev">
+              <Switch id="mirrorprev" checked={settings.mirrorPreview} onChange={(v) => onChange({ mirrorPreview: v })} />
+            </Row>
+            <Row label="Cuenta 3-2-1 antes de grabar" hint="Tiempo para acomodarte y mirar al lente." htmlFor="countdown">
+              <Switch id="countdown" checked={settings.countdown} onChange={(v) => onChange({ countdown: v })} />
+            </Row>
+            <Row label="Información en pantalla" hint="Ritmo, tiempo restante, sección y avisos de luz, encuadre y micrófono. No sale en el video." htmlFor="hud">
+              <Switch id="hud" checked={settings.hud} onChange={(v) => onChange({ hud: v })} />
+            </Row>
+            <Row label="Guías de encuadre" hint="Tercios y línea de ojos antes de grabar, para quedar bien centrado." htmlFor="guides">
+              <Switch id="guides" checked={settings.guides} onChange={(v) => onChange({ guides: v })} />
             </Row>
           </section>
 

@@ -30,3 +30,26 @@ export function isExportFormat(v: unknown): v is ExportFormat {
 export function formatInfo(value: ExportFormat): FormatInfo {
   return EXPORT_FORMATS.find((f) => f.value === value) ?? EXPORT_FORMATS[0];
 }
+
+// ----- Video -----
+
+export type VideoExportFormat = "mp4" | "webm" | "wav" | "mp3";
+
+export type VideoFormatInfo = { value: VideoExportFormat; ext: string; mime: string; label: string; hint: string; audioOnly: boolean };
+
+export const VIDEO_EXPORT_FORMATS: readonly VideoFormatInfo[] = [
+  { value: "mp4", ext: "mp4", mime: "video/mp4", label: "MP4", hint: "H.264 · abre en todo: redes, editores, iPhone", audioOnly: false },
+  { value: "webm", ext: "webm", mime: "video/webm", label: "WebM", hint: "VP9 · más ligero, ideal para web", audioOnly: false },
+  { value: "wav", ext: "wav", mime: "audio/wav", label: "Solo audio · WAV", hint: "La voz sin comprimir, para editar", audioOnly: true },
+  { value: "mp3", ext: "mp3", mime: "audio/mpeg", label: "Solo audio · MP3", hint: "La voz, universal · 192 kbps", audioOnly: true },
+];
+
+export const DEFAULT_VIDEO_EXPORT_FORMAT: VideoExportFormat = "mp4";
+
+export function isVideoExportFormat(v: unknown): v is VideoExportFormat {
+  return typeof v === "string" && VIDEO_EXPORT_FORMATS.some((f) => f.value === v);
+}
+
+export function videoFormatInfo(value: VideoExportFormat): VideoFormatInfo {
+  return VIDEO_EXPORT_FORMATS.find((f) => f.value === value) ?? VIDEO_EXPORT_FORMATS[0];
+}

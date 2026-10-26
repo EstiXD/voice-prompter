@@ -1,11 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { pickRecordingFormat, type RecordingFormat } from "@/lib/audio/mime";
+import { pickRecordingFormat, pickVideoRecordingFormat, type RecordingFormat } from "@/lib/audio/mime";
 
 export type RecorderState = "inactive" | "recording" | "paused";
 
+export type RecordingKind = "audio" | "video";
+
 export type Recording = {
+  kind: RecordingKind;
   blob: Blob;
   url: string;
   mimeType: string;
@@ -22,6 +25,7 @@ export function useRecorder() {
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const formatRef = useRef<RecordingFormat | null>(null);
+  const kindRef = useRef<RecordingKind>("audio");
   const accumulatedRef = useRef(0);
   const segmentStartRef = useRef<number | null>(null);
   const tickRef = useRef<number | null>(null);
@@ -55,12 +59,22 @@ export function useRecorder() {
   }, []);
 
   const start = useCallback(
-    (stream: MediaStream) => {
+    (stream: MediaStream, kind: RecordingKind = "audio") => {
       reset();
-      const format = pickRecordingFormat();
+      const format = kind === "video" ? pickVideoRecordingFormat() : pickRecordingFormat();
       if (!format) throw new Error("Este navegador no soporta MediaRecorder.");
       formatRef.current = format;
-      const rec = new MediaRecorder(stream, format.mimeType ? { mimeType: format.mimeType, audioBitsPerSecond: 128_000 } : undefined);
+      kindRef.current = kind;
+      // video: ~10 Mbps a 1080p (calidad de YouTube 1080p alta); se escala con la resolución
+      const vs = stream.getVideoTracks()[0]?.getSettings();
+      const pixels = (vs?.width ?? 1920) * (vs?.height ?? 1080);
+      const videoBps = Math.round(Math.min(14_000_000, Math.max(4_000_000, (pixels / (1920 * 1080)) * 10_000_000)));
+      const opts: MediaRecorderOptions | undefined = format.mimeType
+        ? kind === "video"
+          ? { mimeType: format.mimeType, videoBitsPerSecond: videoBps, audioBitsPerSecond: 160_000 }
+          : { mimeType: format.mimeType, audioBitsPerSecond: 128_000 }
+        : undefined;
+      const rec = new MediaRecorder(stream, opts);
       chunksRef.current = [];
       rec.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
@@ -105,10 +119,13 @@ export function useRecorder() {
     setElapsedMs(durationMs);
     return new Promise((resolve) => {
       rec.onstop = () => {
-        const format = formatRef.current ?? { mimeType: "audio/webm", ext: "webm", label: "Audio" };
-        const type = rec.mimeType || format.mimeType || "audio/webm";
+        const kind = kindRef.current;
+        const fallback = kind === "video" ? "video/webm" : "audio/webm";
+        const format = formatRef.current ?? { mimeType: fallback, ext: "webm", label: kind === "video" ? "Video" : "Audio" };
+        const type = rec.mimeType || format.mimeType || fallback;
         const blob = new Blob(chunksRef.current, { type });
         const result: Recording = {
+          kind,
           blob,
           url: URL.createObjectURL(blob),
           mimeType: type,

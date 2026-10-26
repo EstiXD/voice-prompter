@@ -1,7 +1,8 @@
 "use client";
 
 import { useMemo } from "react";
-import { IconArrowRight, IconSparkle, IconTrash } from "./icons";
+import { IconArrowRight, IconCamera, IconMic, IconSparkle, IconTrash } from "./icons";
+import type { AppMode } from "@/lib/persist";
 import { SAMPLE_SCRIPT } from "@/lib/sample";
 import { tokenizeScript } from "@/lib/align/tokenize";
 
@@ -9,11 +10,18 @@ type Props = {
   value: string;
   onChange: (v: string) => void;
   onDone: () => void;
+  mode: AppMode;
+  onMode: (m: AppMode) => void;
 };
+
+const MODES: { value: AppMode; title: string; desc: string; Icon: typeof IconMic }[] = [
+  { value: "audio", title: "Solo voz", desc: "Podcast, locución, audiolibro. Audio limpio sin ruido.", Icon: IconMic },
+  { value: "video", title: "Video con cámara", desc: "El texto va bajo tu cámara. Fondos, luz y retoque.", Icon: IconCamera },
+];
 
 const WPM = 140;
 
-export function ScriptEditor({ value, onChange, onDone }: Props) {
+export function ScriptEditor({ value, onChange, onDone, mode, onMode }: Props) {
   const words = useMemo(() => (value.trim() ? tokenizeScript(value).readableWords : 0), [value]);
   const minutes = words / WPM;
   const mm = Math.floor(minutes);
@@ -29,7 +37,7 @@ export function ScriptEditor({ value, onChange, onDone }: Props) {
         </h1>
         <p className="mt-4 max-w-xl text-base text-paper-dim sm:text-lg">
           Pega el texto, pulsa grabar y lee con naturalidad. La palabra que dices se enciende y el texto avanza solo.
-          El audio se graba limpio, sin ruido de fondo.
+          Graba solo tu voz o un video con el texto justo debajo de tu cámara.
         </p>
       </header>
 
@@ -44,6 +52,35 @@ export function ScriptEditor({ value, onChange, onDone }: Props) {
           aria-label="Guion"
         />
       </div>
+
+      <fieldset className="rise-3 mt-4">
+        <legend className="label mb-2">¿Qué vas a grabar?</legend>
+        <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="Qué vas a grabar">
+          {MODES.map(({ value: v, title, desc, Icon }) => {
+            const on = mode === v;
+            return (
+              <button
+                key={v}
+                type="button"
+                role="radio"
+                aria-checked={on}
+                onClick={() => onMode(v)}
+                className={`flex items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-colors ${
+                  on ? "border-amber/70 bg-amber/10 shadow-[0_0_0_1px_rgb(255_177_74/0.3)]" : "border-line-strong bg-surface hover:border-[#5a4e44]"
+                }`}
+              >
+                <span className={`mt-0.5 grid h-9 w-9 flex-none place-items-center rounded-full ${on ? "bg-amber text-[#1a1204]" : "bg-surface-3 text-paper-dim"}`}>
+                  <Icon className="h-5 w-5" />
+                </span>
+                <span>
+                  <span className="block font-semibold text-paper">{title}</span>
+                  <span className="mt-0.5 block text-[0.8rem] leading-snug text-paper-dim">{desc}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </fieldset>
 
       <footer className="rise-3 mt-4 flex flex-wrap items-center gap-3">
         <div className="mr-auto flex items-center gap-4 text-sm text-paper-dim">
@@ -65,7 +102,7 @@ export function ScriptEditor({ value, onChange, onDone }: Props) {
           Limpiar
         </button>
         <button type="button" className="btn btn-primary h-11 px-5 text-[0.95rem]" onClick={onDone} disabled={!canGo}>
-          Ir al prompter
+          {mode === "video" ? "Ir a la cámara" : "Ir a grabar"}
           <IconArrowRight className="h-4 w-4" />
         </button>
       </footer>
@@ -85,8 +122,8 @@ export function ScriptEditor({ value, onChange, onDone }: Props) {
       <ol className="rise-3 mt-6 grid gap-3 text-sm text-paper-dim sm:grid-cols-3">
         {[
           ["1", "Pega el guion", "Cualquier texto. Los números y nombres propios también cuentan."],
-          ["2", "Graba y lee", "El micrófono escucha; cada palabra se ilumina y el texto se desplaza solo."],
-          ["3", "Descarga", "WAV, MP3, MP4, FLAC, OGG o el original. Nada sale de tu navegador."],
+          ["2", "Graba y lee", "Cada palabra que dices se ilumina y el texto sube solo. Si te pierdes, haz clic en la palabra."],
+          ["3", "Descarga", "Voz en WAV, MP3, MP4… o el video en MP4. Nada sale de tu navegador."],
         ].map(([n, t, d]) => (
           <li key={n} className="card flex gap-3 p-4">
             <span className="wordmark text-2xl leading-none text-amber">{n}</span>
