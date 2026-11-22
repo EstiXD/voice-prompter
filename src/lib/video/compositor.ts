@@ -4,30 +4,44 @@
 // que lo que ves es exactamente lo que queda en el video. El texto del
 // teleprompter vive fuera del canvas: nunca sale grabado.
 //
-// Todo corre en el navegador: MediaPipe (wasm + WebGL) para el recorte y la
-// cara, WebGL2 (gl.ts) para armar fondo y persona, y Canvas 2D para el
-// retoque y los ojos. Sin WebGL2 se usa un camino 100 % Canvas 2D. El trabajo
-// por cuadro se mide y, si la máquina no llega, el recorte y la cara se
-// calculan cada 2–3 cuadros reutilizando el último resultado.
+// Quién hace qué:
+//   · hilo principal: solo compone (WebGL2, gl.ts) y pinta el retoque y los
+//     ojos en Canvas 2D. Nunca espera a la GPU.
+//   · worker de recorte y worker de cara (vision.worker.ts): MediaPipe. Sus
+//     modelos tardan y leer el resultado bloquea; ahí no molestan.
+//   · regulador (perf.ts): mide cuadros y tiempos y elige modelo y calidad
+//     para ESTE equipo; lo recuerda entre sesiones.
+//
+// Con fondo activo el cuadro se compone un paso de cámara más tarde: se sube a
+// la GPU, se manda al worker y, al cuadro siguiente, ya llegó SU máscara. Así
+// el borde va clavado aunque te muevas, en vez de arrastrar la máscara del
+// cuadro anterior. Sin worker (navegador viejo) o sin WebGL2 todo sigue en el
+// hilo principal, como antes.
 
 import type { FaceLandmarker, FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
 import { blurPx, imageBlurPx, paintPreset, prepareBackground, type BackgroundChoice } from "./backgrounds";
-import { GlRenderer, type ColorStyle } from "./gl";
+import { GlRenderer, PROBE_H, PROBE_W, type ColorStyle, type EyeWarp } from "./gl";
+import { MaskCleaner, maskDrift, solidEllipse, toBytes, vetoMap } from "./mask";
+import { PerfGovernor, pickDelegate, sanitizeMemory, type PerfMemory, type PerfProfile, type Quality, type SegDelegate, type SegModel } from "./perf";
+import { VisionLink, type FaceResult, type MaskResult } from "./vision-link";
 import {
   eyeRoi,
   eyeShift,
   exposureGain,
-  headTurnFade,
+  gazeDirection,
   gazeOf,
+  gazeToCamera,
   GazeCalibrator,
+  GazeMeter,
+  headPose,
+  headTurnFade,
+  irisReach,
   LM,
-  readGaze,
-  smoothGaze,
-  toPx,
+  movedEye,
   warpEye,
   type EyeGeom,
-  type Gaze,
   type GazeCalibration,
+  type GazeDirection,
   type GazeReading,
   type Pt,
 } from "./face";
@@ -61,6 +75,7 @@ export type VideoFx = {
 };
 
 export type { ColorStyle };
+export type { Quality, SegModel };
 
 export const DEFAULT_FX: VideoFx = {
   light: true,
@@ -73,16 +88,42 @@ export const DEFAULT_FX: VideoFx = {
   style: "natural",
 };
 
-export type CompositorStats = { fps: number; frameMs: number; segEvery: number };
+export type CompositorStats = {
+  /** cuadros compuestos por segundo */
+  fps: number;
+  /** trabajo del hilo principal por cuadro, ms */
+  frameMs: number;
+  /** cada cuántos cuadros llega un recorte nuevo */
+  segEvery: number;
+  /** cuadros que entrega la cámara por segundo (0 = sin medir) */
+  cameraFps: number;
+  /** ida y vuelta de un recorte, ms (0 = sin medir) */
+  segMs: number;
+  /** perfil que eligió el regulador para este equipo */
+  model: SegModel;
+  quality: Quality;
+  /** el recorte corre en su worker (false = hilo principal) */
+  worker: boolean;
+};
 
 export type GazeState = {
   face: boolean;
   calibrated: boolean;
   calibrating: boolean;
   reading: GazeReading | null;
-  /** % de cuadros mirando a cámara desde el último reset */
+  /** % del tiempo mirando a cámara desde el último reset */
   onCameraPct: number;
+  /** ahora mismo, hacia dónde se va la mirada (imagen sin espejo); null si está en el lente */
+  direction: GazeDirection | null;
+  /** en la toma, hacia dónde se fue casi siempre cuando no estuvo en el lente */
+  tendency: GazeDirection | null;
+  /** últimos segundos: fracción del tiempo fuera del lente (−1 = sin datos) y hacia dónde */
+  lately: { offShare: number; tendency: GazeDirection | null };
+  /** la última calibración se descartó (no miraste fijo): sigue valiendo la anterior */
+  calibrationFailed: boolean;
 };
+
+export type { GazeDirection };
 
 export type Framing = {
   face: boolean;
@@ -98,20 +139,79 @@ export type Framing = {
 export type CompositorStatus = { segmenter: "off" | "loading" | "ready" | "error"; face: "off" | "loading" | "ready" | "error" };
 
 const WASM_BASE = "/mediapipe";
-// Multiclase (pelo, piel, ropa…): recorte mucho más limpio que el selfie
-// simple, sin trozos del fondo pegados a hombros y cabeza. El ligero queda de
-// respaldo si el grande no carga.
-const SEG_MODEL = "/models/selfie_multiclass_256x256.tflite";
-const SEG_MODEL_LITE = "/models/selfie_segmenter_landscape.tflite";
-/** ancho del cuadro que se le pasa al recorte (el modelo trabaja a 256 px) */
-const SEG_INPUT_W = 512;
+// "lite" (selfie landscape, 256×144): rápido, corre en casi todo. "multi"
+// (multiclase: pelo, piel, ropa…): borde más fino pero ~5× más caro; el
+// regulador solo lo usa donde sobra gráfica.
+const SEG_MODELS: Record<SegModel, string> = {
+  lite: "/models/selfie_segmenter_landscape.tflite",
+  multi: "/models/selfie_multiclass_256x256.tflite",
+};
+/** lado largo del cuadro que se le pasa al recorte (los modelos trabajan a 256 px) */
+const SEG_INPUT = 512;
+/**
+ * Lado largo del cuadro que se le pasa al detector de cara. Su malla trabaja
+ * sobre un recorte de 256 px de la cara: con 960 una cara a distancia normal
+ * ya llega a esa resolución, y son la mitad de píxeles que subir y bajar de
+ * la gráfica que con el cuadro entero a 720p (la cuarta parte que a 1080p).
+ */
+const FACE_INPUT = 960;
+/** recortes que se miden con cada opción (GPU, CPU) antes de elegir */
+const CALIB_MASKS = 28;
+/**
+ * "Maestro": en equipos de gama media el modelo fino no llega a 30 fps, pero
+ * sí puede correr de vez en cuando en un núcleo libre. Cada pasada marca qué
+ * zonas el modelo rápido confunde con persona (la silla) y la GPU las veta
+ * mientras sigan viéndose igual (gl.ts). Quieto, una pasada cada 3 s; si la
+ * silueta cambió, antes, pero nunca más de una por segundo: cada pasada son
+ * ~0,4 s de un núcleo al 100 %.
+ */
+const TEACH_EVERY_MS = 3000;
+const TEACH_MIN_MS = 1000;
+const TEACH_DRIFT = 0.012;
 const FACE_MODEL = "/models/face_landmarker.task";
 
 type WasmFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
 
-// MediaPipe se carga una vez por página y se reutiliza entre tomas.
+// ----- workers de visión: uno por papel, compartidos entre tomas -----
+
+let segLink: VisionLink | null = null;
+let faceLink: VisionLink | null = null;
+
+function getSegLink(): VisionLink | null {
+  if (!VisionLink.supported()) return null;
+  return (segLink ??= new VisionLink("seg"));
+}
+
+function getFaceLink(): VisionLink | null {
+  if (!VisionLink.supported()) return null;
+  return (faceLink ??= new VisionLink("face"));
+}
+
+let teachLink: VisionLink | null = null;
+
+/**
+ * ¿Este equipo puede permitirse el maestro? Otro worker con su wasm y un
+ * modelo de 16 MB, y un núcleo ocupado a ratos: solo escritorio con núcleos y
+ * memoria de sobra. Se puede forzar con localStorage "vp:teacher" = "1" / "0".
+ */
+function teacherAllowed(): boolean {
+  if (!VisionLink.supported()) return false;
+  try {
+    const force = window.localStorage.getItem("vp:teacher");
+    if (force === "1") return true;
+    if (force === "0") return false;
+  } catch {
+    /* sin localStorage: decide el equipo */
+  }
+  const nav = navigator as Navigator & { deviceMemory?: number; connection?: { saveData?: boolean } };
+  if (isMobile() || nav.connection?.saveData) return false;
+  return (nav.hardwareConcurrency ?? 4) >= 8 && (nav.deviceMemory ?? 8) >= 8;
+}
+
+// ----- respaldo: MediaPipe en el hilo principal (sin workers) -----
+
 let filesetP: Promise<{ mp: typeof import("@mediapipe/tasks-vision"); fileset: WasmFileset }> | null = null;
-let segmenterP: Promise<ImageSegmenter> | null = null;
+const segmenterPs: Partial<Record<SegModel, Promise<ImageSegmenter>>> = {};
 let faceP: Promise<FaceLandmarker> | null = null;
 
 // El wasm de MediaPipe escribe sus logs informativos por console.error/warn
@@ -154,29 +254,23 @@ async function withDelegates<T>(make: (delegate: "GPU" | "CPU") => Promise<T>): 
   }
 }
 
-function loadSegmenter() {
-  segmenterP ??= loadFileset()
-    .then(({ mp, fileset }) => {
-      const make = (model: string) =>
-        withDelegates((delegate) =>
-          mp.ImageSegmenter.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: model, delegate },
-            runningMode: "VIDEO",
-            outputConfidenceMasks: true,
-            outputCategoryMask: false,
-          }),
-        );
-      const preferred = (process.env.NODE_ENV !== "production" && localStorage.getItem("vp:segModel")) || SEG_MODEL;
-      return make(preferred).catch((err) => {
-        console.warn("[video] el recorte multiclase no cargó; uso el ligero:", err);
-        return make(SEG_MODEL_LITE);
-      });
-    })
+function loadSegmenter(model: SegModel): Promise<ImageSegmenter> {
+  const p = (segmenterPs[model] ??= loadFileset()
+    .then(({ mp, fileset }) =>
+      withDelegates((delegate) =>
+        mp.ImageSegmenter.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: SEG_MODELS[model], delegate },
+          runningMode: "VIDEO",
+          outputConfidenceMasks: true,
+          outputCategoryMask: false,
+        }),
+      ),
+    )
     .catch((err) => {
-      segmenterP = null;
+      delete segmenterPs[model];
       throw err;
-    });
-  return segmenterP;
+    }));
+  return p;
 }
 
 function loadFace() {
@@ -188,7 +282,7 @@ function loadFace() {
           runningMode: "VIDEO",
           numFaces: 1,
           outputFaceBlendshapes: false,
-          outputFacialTransformationMatrixes: false,
+          outputFacialTransformationMatrixes: true,
         }),
       ),
     )
@@ -199,10 +293,95 @@ function loadFace() {
   return faceP;
 }
 
+// ----- perfil de rendimiento de este equipo -----
+
+const PERF_KEY = "voice-prompter:perf:v1";
+
+function isMobile(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const uaData = (navigator as Navigator & { userAgentData?: { mobile?: boolean } }).userAgentData;
+  if (uaData && typeof uaData.mobile === "boolean") return uaData.mobile;
+  // un iPad se presenta como Mac: lo delata la pantalla táctil
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+}
+
+function loadPerfMemory(): PerfMemory {
+  let raw: unknown = null;
+  try {
+    raw = JSON.parse(window.localStorage.getItem(PERF_KEY) ?? "null");
+  } catch {
+    /* modo privado o dato roto: se empieza de cero */
+  }
+  return sanitizeMemory(raw, isMobile(), Date.now());
+}
+
+function savePerfMemory(m: PerfMemory) {
+  try {
+    window.localStorage.setItem(PERF_KEY, JSON.stringify(m));
+  } catch {
+    /* cuota llena o modo privado */
+  }
+}
+
+// ----- calibración de la mirada: se recuerda entre sesiones -----
+
+const GAZE_KEY = "voice-prompter:gaze:v1";
+const GAZE_TTL_MS = 30 * 24 * 3600 * 1000;
+
+/**
+ * Como la mirada ya descuenta el giro y la posición de la cabeza, la
+ * referencia de "mirar al lente" depende casi solo de tus ojos y de esta
+ * cámara: vale de un día para otro. Así el medidor funciona nada más abrir, y
+ * cada cuenta 3-2-1 la refresca.
+ */
+function loadGazeCalibration(): GazeCalibration | null {
+  try {
+    const o = JSON.parse(window.localStorage.getItem(GAZE_KEY) ?? "null") as { h?: unknown; v?: unknown; samples?: unknown; at?: unknown } | null;
+    if (!o || typeof o.h !== "number" || typeof o.v !== "number" || typeof o.at !== "number") return null;
+    if (!Number.isFinite(o.h) || !Number.isFinite(o.v) || Date.now() - o.at > GAZE_TTL_MS) return null;
+    return { h: o.h, v: o.v, samples: typeof o.samples === "number" ? o.samples : 0 };
+  } catch {
+    return null;
+  }
+}
+
+function saveGazeCalibration(c: GazeCalibration) {
+  try {
+    window.localStorage.setItem(GAZE_KEY, JSON.stringify({ ...c, at: Date.now() }));
+  } catch {
+    /* cuota llena o modo privado */
+  }
+}
+
+/**
+ * Perfil fijado a mano (para probar y para soporte): en la consola,
+ * localStorage.setItem("vp:perf", "multi,2") y recargar. Se quita con removeItem.
+ */
+function forcedProfile(): PerfProfile | null {
+  try {
+    const m = /^(lite|multi),([012])$/.exec(window.localStorage.getItem("vp:perf") ?? "");
+    return m ? { model: m[1] as SegModel, quality: Number(m[2]) as Quality } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** El modelo fino solo corre en la gráfica (en CPU tarda ~0,3 s por cuadro). */
+function delegateFor(model: SegModel, mem: PerfMemory): SegDelegate {
+  return model === "multi" ? "GPU" : (mem.segDelegate ?? "GPU");
+}
+
 /** Precarga en segundo plano (al entrar al modo cámara). */
 export function preloadVision(face: boolean): void {
-  void loadSegmenter().catch(() => {});
-  if (face) void loadFace().catch(() => {});
+  const mem = loadPerfMemory();
+  const model = (forcedProfile() ?? mem).model;
+  const seg = getSegLink();
+  if (seg && seg.state !== "error") seg.load(SEG_MODELS[model], delegateFor(model, mem));
+  else void loadSegmenter(model).catch(() => {});
+  if (!face) return;
+  const fl = getFaceLink();
+  if (fl && fl.state !== "error") fl.load(FACE_MODEL, "CPU");
+  else void loadFace().catch(() => {});
 }
 
 const smoothstep = (a: number, b: number, x: number) => {
@@ -225,6 +404,7 @@ function polyPath(path: Path2D, pts: readonly Pt[], idx: readonly number[]) {
 }
 
 type Listener = () => void;
+type FrameMeta = { presentedFrames?: number };
 
 export class VideoCompositor {
   readonly canvas: HTMLCanvasElement;
@@ -238,7 +418,23 @@ export class VideoCompositor {
   private mask: { c: HTMLCanvasElement; ctx: CanvasRenderingContext2D; img: ImageData | null; prev: Float32Array | null; ready: boolean };
   /** máscara suavizada a su resolución (barato) antes de escalarla: borde sin escalones */
   private soft = canvas2d(2, 2);
-  private segIn = canvas2d(SEG_INPUT_W, 288);
+  /** cuadro chico para el recorte en el hilo principal (respaldo) */
+  private segIn = canvas2d(SEG_INPUT, 288);
+  /** cuadro chico para el worker: sale como ImageBitmap sin copiar píxeles */
+  private segOut: { c: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } | null = null;
+  private faceOut: { c: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } | null = null;
+  // maestro (ver TEACH_EVERY_MS)
+  private readonly canTeach = teacherAllowed();
+  private teach: VisionLink | null = null;
+  private teachOut: { c: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } | null = null;
+  private teachId = -1;
+  private teachAt = 0;
+  /** la máscara del modelo rápido para el cuadro que está viendo el maestro */
+  private teachFast: Uint8Array | null = null;
+  private vetoBuf: Uint8Array | null = null;
+  private vetoTmp: Uint8Array | null = null;
+  /** midiendo si a este equipo le rinde más recortar en GPU o en CPU */
+  private calib: { stage: SegDelegate; masks: number; gpuMs: number } | null = null;
   private gl: GlRenderer | null = null;
   private look: BackgroundLook = { ...DEFAULT_LOOK };
   private bgSource: (CanvasImageSource & { width: number; height: number }) | null = null;
@@ -246,8 +442,19 @@ export class VideoCompositor {
   private probe = canvas2d(24, 24, { willReadFrequently: true });
   private eyeBuf = canvas2d(8, 8, { willReadFrequently: true });
 
-  private segmenter: ImageSegmenter | null = null;
-  private face: FaceLandmarker | null = null;
+  // recorte: worker (lo normal) o hilo principal (respaldo)
+  private readonly segLink = getSegLink();
+  private readonly faceLink = getFaceLink();
+  private segMain: ImageSegmenter | null = null;
+  private segMainModel: SegModel | null = null;
+  private faceMain: FaceLandmarker | null = null;
+  private readonly cleaner = new MaskCleaner();
+  private mainBytes: Uint8Array | null = null;
+  /** la máscara más nueva que llegó del worker y aún no se usó */
+  private pendingMask: MaskResult | null = null;
+  /** hay un cuadro subido a la GPU esperando su máscara */
+  private held = false;
+
   private bg: BackgroundChoice = { kind: "none" };
   private bgImage: CanvasImageSource | null = null;
   private bgImageKey = "";
@@ -269,25 +476,43 @@ export class VideoCompositor {
   private landmarks: Pt[] | null = null;
   private faceMiss = 0;
   private lastFaceAt = 0;
-  private gazeSmooth: Gaze | null = null;
   private eyes: [EyeGeom, EyeGeom] | null = null;
-  private calibration: GazeCalibration | null = null;
+  /** los dos últimos juegos de ojos con el cuadro del que salieron: para saber cómo se mueven */
+  private eyeHist: { id: number; eyes: [EyeGeom, EyeGeom] }[] = [];
+  private readonly meter = new GazeMeter();
+  private calibration: GazeCalibration | null = loadGazeCalibration();
   private calibrator: GazeCalibrator | null = null;
   private calibrateUntil = 0;
-  private gazeFrames = 0;
-  private gazeOnFrames = 0;
+  private calibFailedAt = 0;
   private reading: GazeReading | null = null;
+  /** ya llegó alguna pose de cabeza: desde entonces una muestra sin pose no se mezcla con las demás */
+  private poseSeen = false;
+  /** cuadro (número) que tiene ahora la textura de video de la GPU */
+  private glFrame = 0;
 
   // rendimiento
+  private readonly governor: PerfGovernor;
+  private readonly forced: PerfProfile | null;
+  private profile: PerfProfile;
   private frameMsEma = 8;
   private fps = 0;
+  private cameraFps = 0;
   private fpsFrames = 0;
   private fpsWindow = 0;
+  private fpsMasks = 0;
+  private maskEvery = 1;
+  private presentedAt = -1;
+  private totalAt = -1;
+  /** respaldo en el hilo principal: cada cuántos cuadros se recorta */
   private segEvery = 1;
   private faceEvery = 3;
 
   readonly status: CompositorStatus = { segmenter: "off", face: "off" };
   private listeners = new Set<Listener>();
+  private readonly onVisibility = () => {
+    // en segundo plano el navegador frena los cuadros: eso no es culpa del equipo
+    if (!document.hidden) this.governor.settle(performance.now());
+  };
 
   constructor(camera: MediaStream) {
     this.video = document.createElement("video");
@@ -311,6 +536,23 @@ export class VideoCompositor {
     this.small = canvas2d(Math.max(2, Math.round(this.W / 6)), Math.max(2, Math.round(this.H / 6)));
     const m = canvas2d(2, 2);
     this.mask = { ...m, img: null, prev: null, ready: false };
+
+    this.forced = forcedProfile();
+    const mobile = isMobile();
+    const saveData = !!(navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData;
+    this.governor = new PerfGovernor(loadPerfMemory(), { allowMulti: !mobile && !saveData });
+    this.profile = this.forced ?? this.governor.profile;
+    this.governor.settle(performance.now(), 3500);
+
+    if (this.segLink) {
+      this.segLink.onMask = (r) => this.onMask(r);
+      this.segLink.onState = () => this.onSegState();
+    }
+    if (this.faceLink) {
+      this.faceLink.onFace = (r) => this.onFaceResult(r);
+      this.faceLink.onState = () => this.onFaceState();
+    }
+    document.addEventListener("visibilitychange", this.onVisibility);
 
     this.stream = this.canvas.captureStream(0);
     this.track = this.stream.getVideoTracks()[0];
@@ -341,7 +583,17 @@ export class VideoCompositor {
   }
 
   get stats(): CompositorStats {
-    return { fps: this.fps, frameMs: Math.round(this.frameMsEma * 10) / 10, segEvery: this.segEvery };
+    const worker = this.segLink?.state === "ready";
+    return {
+      fps: this.fps,
+      frameMs: Math.round(this.frameMsEma * 10) / 10,
+      segEvery: worker ? this.maskEvery : this.segEvery,
+      cameraFps: this.cameraFps,
+      segMs: worker ? Math.round(this.segLink!.roundTrip * 10) / 10 : 0,
+      model: this.activeModel(),
+      quality: this.profile.quality,
+      worker,
+    };
   }
 
   /** Encuadre y luz para los avisos en pantalla (coordenadas 0–1 de la imagen sin espejo). */
@@ -358,12 +610,18 @@ export class VideoCompositor {
   }
 
   get gaze(): GazeState {
+    const r = this.reading;
+    const sum = this.meter.summary;
     return {
       face: !!this.landmarks,
       calibrated: !!this.calibration,
       calibrating: !!this.calibrator,
-      reading: this.reading,
-      onCameraPct: this.gazeFrames ? Math.round((this.gazeOnFrames / this.gazeFrames) * 100) : 0,
+      reading: r,
+      onCameraPct: sum.onCameraPct,
+      direction: r && this.calibration && !r.onCamera ? gazeDirection(r.dh, r.dv) : null,
+      tendency: sum.tendency,
+      lately: this.calibration && this.fx.gazeMeter ? this.meter.lately : { offShare: -1, tendency: null },
+      calibrationFailed: this.calibFailedAt > 0 && performance.now() - this.calibFailedAt < 6000,
     };
   }
 
@@ -372,6 +630,7 @@ export class VideoCompositor {
   }
 
   async setBackground(bg: BackgroundChoice, custom?: Blob): Promise<void> {
+    const was = this.bg.kind;
     this.bg = bg;
     if (bg.kind === "preset" || bg.kind === "custom") {
       const key = `${bg.kind}:${bg.id}`;
@@ -387,7 +646,15 @@ export class VideoCompositor {
       }
       this.prepareImage();
     }
-    if (bg.kind !== "none") await this.ensureSegmenter();
+    if (bg.kind === "none") {
+      // al volver a poner fondo no debe asomar el recorte de hace un rato
+      this.gl?.resetMask();
+      this.mask.ready = false;
+      this.pendingMask = null;
+    } else {
+      if (was === "none") this.governor.settle(performance.now());
+      this.ensureSegmenter();
+    }
   }
 
   /** Cuánto se desenfoca el fondo real y la imagen de fondo. */
@@ -418,20 +685,25 @@ export class VideoCompositor {
 
   setFx(fx: VideoFx): void {
     this.fx = { ...fx };
-    if (fx.light || fx.beauty || fx.eyeContact || fx.gazeMeter || fx.studioLight) void this.ensureFace();
+    if (fx.light || fx.beauty || fx.eyeContact || fx.gazeMeter || fx.studioLight) this.ensureFace();
   }
 
   /** Mira a la cámara ~1,5 s: fija tu "mirada a cámara" de referencia. */
   calibrate(ms = 1500): void {
-    void this.ensureFace();
+    this.ensureFace();
     this.calibrator = new GazeCalibrator();
     this.calibrateUntil = performance.now() + ms;
+    this.calibFailedAt = 0;
     this.notify();
   }
 
   resetGazeStats(): void {
-    this.gazeFrames = 0;
-    this.gazeOnFrames = 0;
+    this.meter.resetStats();
+  }
+
+  /** Grabando no se prueban perfiles más pesados: una prueba fallida son cuadros perdidos en la toma. */
+  setLive(live: boolean): void {
+    this.governor.allowTrials(!live);
   }
 
   destroy(): void {
@@ -439,6 +711,15 @@ export class VideoCompositor {
     this.destroyed = true;
     if (this.rvfc && "cancelVideoFrameCallback" in this.video) this.video.cancelVideoFrameCallback(this.rvfc);
     if (this.raf) cancelAnimationFrame(this.raf);
+    document.removeEventListener("visibilitychange", this.onVisibility);
+    // el maestro ocupa memoria (otro wasm, 16 MB de modelo): se va con la cámara
+    if (this.teach) {
+      this.teach.onMask = null;
+      this.teach.dispose();
+    }
+    // los workers siguen vivos para la próxima toma; solo dejan de avisarle a este compositor
+    if (this.segLink) this.segLink.onMask = this.segLink.onState = null;
+    if (this.faceLink) this.faceLink.onFace = this.faceLink.onState = null;
     this.track.stop();
     this.video.srcObject = null;
     this.video.remove();
@@ -449,26 +730,132 @@ export class VideoCompositor {
 
   // ----- carga de modelos -----
 
-  private async ensureSegmenter() {
-    if (this.segmenter || this.status.segmenter === "loading") return;
-    this.status.segmenter = "loading";
-    this.notify();
-    try {
-      this.segmenter = await loadSegmenter();
-      this.status.segmenter = "ready";
-    } catch (err) {
-      console.error("[video] no pude cargar el recorte de fondo:", err);
-      this.status.segmenter = "error";
+  /** modelo que está recortando ahora mismo (puede ir un paso detrás del perfil mientras carga el nuevo) */
+  private activeModel(): SegModel {
+    const link = this.segLink;
+    if (link?.state === "ready") return link.model === SEG_MODELS.multi ? "multi" : "lite";
+    return this.segMainModel ?? this.profile.model;
+  }
+
+  private ensureSegmenter() {
+    const model = this.profile.model;
+    const link = this.segLink;
+    if (link && link.state !== "error") {
+      link.load(SEG_MODELS[model], this.calib && model === "lite" ? this.calib.stage : delegateFor(model, this.governor.memory));
+      this.onSegState();
+      return;
+    }
+    void this.ensureSegmenterMain(model);
+  }
+
+  /**
+   * Primera vez en este equipo: se recorta un segundo en la gráfica y otro en
+   * el procesador, y se queda el que le convenga (pickDelegate). El cambio no
+   * se nota: el modelo anterior sigue sirviendo mientras carga el otro.
+   */
+  private calibrateDelegate(link: VisionLink) {
+    if (this.forced || this.profile.model !== "lite" || link.switching) return;
+    const now = performance.now();
+    if (!this.calib) {
+      if (this.governor.memory.segDelegate || link.delegate !== "GPU") return;
+      this.calib = { stage: "GPU", masks: 0, gpuMs: 0 };
+      this.governor.settle(now, 5000);
+      return;
+    }
+    const cal = this.calib;
+    if (link.delegate !== cal.stage) return;
+    if (++cal.masks < CALIB_MASKS) return;
+    if (cal.stage === "GPU") {
+      cal.gpuMs = link.roundTrip;
+      cal.stage = "CPU";
+      cal.masks = 0;
+      this.governor.settle(now, 5000);
+      link.load(SEG_MODELS.lite, "CPU");
+      return;
+    }
+    this.finishCalibration(link.roundTrip);
+  }
+
+  private finishCalibration(cpuMs: number) {
+    const cal = this.calib;
+    if (!cal) return;
+    this.calib = null;
+    const frameMs = 1000 / (this.cameraFps || 30);
+    const pick = pickDelegate(cal.gpuMs, cpuMs, frameMs);
+    this.governor.setDelegate(pick);
+    savePerfMemory(this.governor.memory);
+    this.governor.settle(performance.now());
+    if (this.profile.model === "lite") this.segLink?.load(SEG_MODELS.lite, pick);
+  }
+
+  private onSegState() {
+    const link = this.segLink;
+    if (!link || this.destroyed) return;
+    if (link.state === "error") {
+      // el worker no arrancó (navegador sin OffscreenCanvas en workers…): al hilo principal
+      if (this.bg.kind !== "none") void this.ensureSegmenterMain(this.profile.model);
+    } else {
+      this.status.segmenter = link.state === "ready" ? "ready" : "loading";
+      if (link.state === "ready") this.governor.settle(performance.now());
+      if (link.loadFailed) {
+        // midiendo, el procesador no pudo con el modelo: se queda la gráfica
+        if (this.calib?.stage === "CPU") this.finishCalibration(0);
+        // el modelo fino no cargó (sin red, archivo que falta): la prueba se da por perdida
+        else this.applyProfile(this.governor.failTrial(performance.now()));
+      }
     }
     this.notify();
   }
 
-  private async ensureFace() {
-    if (this.face || this.status.face === "loading") return;
+  private async ensureSegmenterMain(model: SegModel) {
+    if (this.segMainModel === model && this.segMain) return;
+    if (!this.segMain) {
+      this.status.segmenter = "loading";
+      this.notify();
+    }
+    try {
+      const seg = await loadSegmenter(model);
+      if (this.destroyed) return;
+      this.segMain = seg;
+      this.segMainModel = model;
+      this.status.segmenter = "ready";
+      this.governor.settle(performance.now());
+    } catch (err) {
+      if (model === "multi") {
+        console.warn("[video] el recorte fino no cargó; sigo con el ligero:", err);
+        this.applyProfile(this.governor.failTrial(performance.now()) ?? { model: "lite", quality: this.profile.quality });
+        return;
+      }
+      console.error("[video] no pude cargar el recorte de fondo:", err);
+      if (!this.segMain) this.status.segmenter = "error";
+    }
+    this.notify();
+  }
+
+  private ensureFace() {
+    const link = this.faceLink;
+    if (link && link.state !== "error") {
+      link.load(FACE_MODEL, "CPU");
+      this.onFaceState();
+      return;
+    }
+    void this.ensureFaceMain();
+  }
+
+  private onFaceState() {
+    const link = this.faceLink;
+    if (!link || this.destroyed) return;
+    if (link.state === "error") void this.ensureFaceMain();
+    else this.status.face = link.state === "ready" ? "ready" : "loading";
+    this.notify();
+  }
+
+  private async ensureFaceMain() {
+    if (this.faceMain || this.status.face === "loading") return;
     this.status.face = "loading";
     this.notify();
     try {
-      this.face = await loadFace();
+      this.faceMain = await loadFace();
       this.status.face = "ready";
     } catch (err) {
       console.error("[video] no pude cargar el detector de cara:", err);
@@ -477,45 +864,103 @@ export class VideoCompositor {
     this.notify();
   }
 
+  private applyProfile(p: PerfProfile | null) {
+    if (!p || this.forced) return;
+    const modelChanged = p.model !== this.profile.model;
+    this.profile = p;
+    savePerfMemory(this.governor.memory);
+    if (modelChanged && this.bg.kind !== "none") this.ensureSegmenter();
+    this.notify();
+  }
+
   // ----- bucle -----
 
   private schedule() {
     if (this.destroyed) return;
     if ("requestVideoFrameCallback" in this.video) {
-      this.rvfc = this.video.requestVideoFrameCallback(() => this.onFrame());
+      this.rvfc = this.video.requestVideoFrameCallback((_now, meta) => this.onFrame(meta));
     } else {
-      this.raf = requestAnimationFrame(() => this.onFrame());
+      this.raf = requestAnimationFrame(() => this.onFrame(null));
     }
   }
 
-  private onFrame() {
+  private onFrame(meta: FrameMeta | null) {
     if (this.destroyed) return;
     this.schedule();
     if (this.video.readyState < 2 || !this.video.videoWidth) return;
     const t0 = performance.now();
+    let drew = false;
     try {
-      this.process(t0);
+      drew = this.process(t0);
     } catch (err) {
       console.error("[video] cuadro fallido:", err);
     }
     const t1 = performance.now();
     this.frameMsEma = this.frameMsEma * 0.9 + (t1 - t0) * 0.1;
-    // cuadros entregados por segundo, en ventanas de 1 s
+    if (drew && "requestFrame" in this.track) this.track.requestFrame();
+
+    // cuadros por segundo, en ventanas de 1 s; con eso decide el regulador
     this.fpsFrames++;
-    if (!this.fpsWindow) this.fpsWindow = t1;
-    if (t1 - this.fpsWindow >= 1000) {
-      this.fps = Math.round((this.fpsFrames * 1000) / (t1 - this.fpsWindow));
-      this.fpsFrames = 0;
+    if (!this.fpsWindow) {
       this.fpsWindow = t1;
+      this.snapshotCamera(meta);
     }
-    // presupuesto: a 30 fps hay 33 ms por cuadro; dejar aire al resto de la página
+    const span = t1 - this.fpsWindow;
+    if (span >= 1000) {
+      this.fps = Math.round((this.fpsFrames * 1000) / span);
+      this.cameraFps = this.measureCamera(meta, span);
+      this.maskEvery = this.fpsMasks ? Math.max(1, Math.round(this.fpsFrames / this.fpsMasks)) : 1;
+      const segOn = this.bg.kind !== "none" && this.status.segmenter === "ready";
+      this.fpsFrames = 0;
+      this.fpsMasks = 0;
+      this.fpsWindow = t1;
+      // Una ventana tapada o en segundo plano se pinta a ~1 cuadro por
+      // segundo: eso es el navegador ahorrando, no que el equipo no pueda. No
+      // siempre avisa con document.hidden, así que también se mira el ritmo.
+      const throttled = document.hidden || this.fps <= 4;
+      if (throttled) this.governor.settle(t1);
+      if (!this.forced && this.cameraFps > 0 && !throttled) {
+        const worker = this.segLink?.state === "ready";
+        // en el hilo principal el recorte tarda lo que tarda el cuadro
+        const segMs = !segOn ? 0 : worker ? this.segLink!.roundTrip : this.frameMsEma * this.segEvery;
+        const next = this.governor.update({ fps: this.fps, cameraFps: this.cameraFps, segOn, segMs }, t1);
+        if (next) this.applyProfile(next);
+        else if (this.governor.takeConfirmed()) savePerfMemory(this.governor.memory);
+      }
+    }
+
+    // respaldo en el hilo principal: si el recorte no cabe en el cuadro, se salta cuadros
     if (this.frame % 30 === 0) {
       if (this.frameMsEma > 24 && this.segEvery < 3) this.segEvery++;
       else if (this.frameMsEma < 12 && this.segEvery > 1) this.segEvery--;
-      this.faceEvery = this.fx.eyeContact ? Math.max(1, this.segEvery) : 3;
+      // corrigiendo los ojos la cara se pide más seguido (entre detecciones los ojos
+      // se llevan a donde estarán: ver eyeWarps); cada cuadro sería un núcleo entero
+      this.faceEvery = this.fx.eyeContact ? 2 : 3;
     }
-    if ("requestFrame" in this.track) this.track.requestFrame();
     if (this.frame % 10 === 0) this.notify();
+  }
+
+  private snapshotCamera(meta: FrameMeta | null) {
+    this.presentedAt = typeof meta?.presentedFrames === "number" ? meta.presentedFrames : -1;
+    const q = this.video.getVideoPlaybackQuality?.();
+    this.totalAt = q && q.totalVideoFrames > 0 ? q.totalVideoFrames : -1;
+  }
+
+  /**
+   * Cuadros por segundo que de verdad entregó la cámara en la ventana: con
+   * poca luz muchas webcams bajan solas a 15 fps, y eso no es que el equipo no
+   * pueda. Se toma el mayor de lo que el navegador dice haber recibido,
+   * presentado, y lo que procesamos. Sin esos contadores (navegador sin
+   * requestVideoFrameCallback) devuelve 0 y el regulador no opina.
+   */
+  private measureCamera(meta: FrameMeta | null, span: number): number {
+    const before = { presented: this.presentedAt, total: this.totalAt };
+    this.snapshotCamera(meta);
+    let frames = -1;
+    if (before.presented >= 0 && this.presentedAt >= 0) frames = Math.max(frames, this.presentedAt - before.presented);
+    if (before.total >= 0 && this.totalAt >= 0) frames = Math.max(frames, this.totalAt - before.total);
+    if (frames < 0) return 0;
+    return Math.round((Math.max(frames, this.fpsFrames) * 1000) / span);
   }
 
   private resize(w: number, h: number) {
@@ -528,11 +973,13 @@ export class VideoCompositor {
     this.small.c.width = Math.max(2, Math.round(w / 6));
     this.small.c.height = Math.max(2, Math.round(h / 6));
     this.gl?.resize(w, h);
+    this.held = false;
     this.bgPrepKey = "";
     this.prepareImage();
   }
 
-  private process(now: number) {
+  /** Devuelve true si pintó un cuadro nuevo en el canvas. */
+  private process(now: number): boolean {
     const v = this.video;
     if (v.videoWidth !== this.W || v.videoHeight !== this.H) this.resize(v.videoWidth, v.videoHeight);
     // MediaPipe en modo VIDEO exige marcas de tiempo estrictamente crecientes
@@ -540,302 +987,342 @@ export class VideoCompositor {
     this.lastTs = ts;
     this.frame++;
 
-    const wantSeg = this.bg.kind !== "none" && !!this.segmenter;
-    if (wantSeg && this.frame % this.segEvery === 0) this.segment(ts);
+    const bgOn = this.bg.kind !== "none";
+    const segWorker = bgOn && this.segLink?.state === "ready";
+    const segMain = bgOn && !segWorker && !!this.segMain;
 
-    const wantFace = !!this.face && (this.fx.light || this.fx.beauty || this.fx.eyeContact || this.fx.gazeMeter || this.fx.studioLight || !!this.calibrator);
-    if (wantFace && this.frame % this.faceEvery === 0) this.detectFace(ts);
-    if (!wantFace && this.landmarks) this.landmarks = null;
+    const wantFace = this.fx.light || this.fx.beauty || this.fx.eyeContact || this.fx.gazeMeter || this.fx.studioLight || !!this.calibrator;
+    if (wantFace) this.requestFace(ts);
+    else if (this.landmarks) this.landmarks = null;
 
-    if (this.fx.light && this.frame % 6 === 0) this.updateExposure();
+    const gl = this.gl;
+    if (!gl) {
+      // sin WebGL2: todo en Canvas 2D, con la máscara más nueva que haya
+      if (segWorker) this.sendSegFrame(ts);
+      else if (segMain && this.frame % this.segEvery === 0) this.segmentMain(ts);
+      this.takeMask();
+      if (this.fx.light && this.frame % 6 === 0) this.updateExposure();
+      if (!this.fx.light) this.gain = 1;
+      this.draw(bgOn && this.mask.ready);
+      return true;
+    }
+
+    const probe = gl.pollProbe();
+    if (probe && this.fx.light) this.readProbe(probe);
     if (!this.fx.light) this.gain = 1;
 
-    if (this.gl) this.drawGl(wantSeg);
-    else this.draw(wantSeg && this.mask.ready);
+    let drew = false;
+    if (segWorker) {
+      // emparejado: se compone el cuadro ANTERIOR, cuya máscara ya llegó
+      if (this.held) {
+        this.takeMask();
+        this.drawGl(true);
+        drew = true;
+      }
+      gl.upload(v);
+      this.glFrame = this.frame;
+      this.held = true;
+      this.sendSegFrame(ts);
+    } else {
+      if (segMain && this.frame % this.segEvery === 0) this.segmentMain(ts);
+      gl.upload(v);
+      this.glFrame = this.frame;
+      this.held = false;
+      this.drawGl(segMain);
+      drew = true;
+    }
+    if (this.fx.light && this.frame % 6 === 0) gl.requestProbe();
+    return drew;
   }
 
-  private segment(ts: number) {
-    // el modelo trabaja a 256 px: pasarle un cuadro chico evita escalar y leer
-    // de vuelta una máscara del tamaño del video en cada cuadro
+  // ----- recorte -----
+
+  /** Tamaño del cuadro reducido que ve el modelo: lado largo SEG_INPUT. */
+  private segSize(): [number, number] {
+    const k = SEG_INPUT / Math.max(1, Math.max(this.W, this.H));
+    return [Math.max(2, Math.round(this.W * k)), Math.max(2, Math.round(this.H * k))];
+  }
+
+  private sendSegFrame(ts: number) {
+    const link = this.segLink!;
+    if (link.busy) {
+      link.watchdog();
+      return;
+    }
+    const [w, h] = this.segSize();
+    if (!this.segOut) {
+      const c = new OffscreenCanvas(w, h);
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      this.segOut = { c, ctx };
+    }
+    const so = this.segOut;
+    if (so.c.width !== w || so.c.height !== h) {
+      so.c.width = w;
+      so.c.height = h;
+    }
+    // reducir con filtro: un cuadro con dientes de sierra confunde al modelo
+    so.ctx.imageSmoothingQuality = "medium";
+    so.ctx.drawImage(this.video, 0, 0, w, h);
+    const bmp = so.c.transferToImageBitmap();
+    if (!link.send(this.frame, ts, bmp)) {
+      bmp.close();
+      return;
+    }
+    this.maybeTeach(ts, w, h);
+  }
+
+  private onMask(r: MaskResult) {
+    if (this.destroyed || this.bg.kind === "none") return;
+    // copia antes de que nadie la toque: el maestro la compara con la suya
+    if (r.id === this.teachId && !this.teachFast) this.teachFast = r.data.slice();
+    else if (this.teachFast && this.teachAt && maskDrift(r.data, this.teachFast) > TEACH_DRIFT) this.teachAt = Math.min(this.teachAt, performance.now() - (TEACH_EVERY_MS - TEACH_MIN_MS));
+    this.pendingMask = r;
+    this.fpsMasks++;
+    if (this.segLink) this.calibrateDelegate(this.segLink);
+  }
+
+  /** El maestro solo acompaña al modelo rápido, con WebGL2 y en la calidad más alta. */
+  private teacherWanted(): boolean {
+    return this.canTeach && !!this.gl && !this.calib && this.profile.model === "lite" && this.profile.quality === 2 && this.activeModel() === "lite";
+  }
+
+  /** Le manda al maestro el mismo cuadro que acaba de salir hacia el modelo rápido. */
+  private maybeTeach(ts: number, w: number, h: number) {
+    if (!this.teacherWanted()) {
+      if (this.teachAt) {
+        this.teachAt = 0;
+        this.gl?.clearVeto();
+      }
+      return;
+    }
+    const t = (this.teach ??= teachLink ??= new VisionLink("seg"));
+    if (t.state === "error") return;
+    if (t.state === "off") {
+      t.onMask = (r) => this.onTeach(r);
+      t.load(SEG_MODELS.multi, "CPU");
+      return;
+    }
+    if (t.state !== "ready") return;
+    if (t.busy) {
+      t.watchdog();
+      return;
+    }
+    const now = performance.now();
+    if (this.teachAt && now - this.teachAt < TEACH_EVERY_MS) return;
+    if (!this.teachOut) {
+      const c = new OffscreenCanvas(w, h);
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      this.teachOut = { c, ctx };
+    }
+    const to = this.teachOut;
+    if (to.c.width !== w || to.c.height !== h) {
+      to.c.width = w;
+      to.c.height = h;
+    }
+    to.ctx.imageSmoothingQuality = "medium";
+    to.ctx.drawImage(this.video, 0, 0, w, h);
+    const bmp = to.c.transferToImageBitmap();
+    if (!t.send(this.frame, ts, bmp)) {
+      bmp.close();
+      return;
+    }
+    this.teachId = this.frame;
+    this.teachFast = null;
+    this.teachAt = now;
+    this.gl!.snapshotRef();
+  }
+
+  private onTeach(fine: MaskResult) {
+    const fast = this.teachFast;
+    if (this.destroyed || !this.gl || fine.id !== this.teachId || !fast || fast.length !== fine.data.length) return;
+    if (!this.teacherWanted() || this.bg.kind === "none") return;
+    const vw = fine.w >> 1;
+    const vh = fine.h >> 1;
+    if (this.vetoBuf?.length !== vw * vh) {
+      this.vetoBuf = new Uint8Array(vw * vh);
+      this.vetoTmp = new Uint8Array(vw * vh);
+    }
+    vetoMap(fast, fine.data, fine.w, fine.h, this.vetoBuf, this.vetoTmp!);
+    this.gl.setVeto(this.vetoBuf, vw, vh);
+  }
+
+  /** Pasa a la GPU (o al camino 2D) la máscara que llegó del worker, si hay una nueva. */
+  private takeMask() {
+    const r = this.pendingMask;
+    if (!r) return;
+    this.pendingMask = null;
+    this.useMask(r.data, r.w, r.h);
+  }
+
+  private useMask(data: Uint8Array, w: number, h: number) {
+    this.solidFace(data, w, h);
+    if (this.gl) this.gl.setMask(data, w, h);
+    else this.mask2d(data, w, h);
+  }
+
+  /** Respaldo: recorte en el hilo principal (bloquea mientras la GPU contesta). */
+  private segmentMain(ts: number) {
     const si = this.segIn;
-    const sh = Math.max(2, Math.round((SEG_INPUT_W * this.H) / Math.max(1, this.W)));
-    if (si.c.height !== sh) si.c.height = sh;
-    si.ctx.drawImage(this.video, 0, 0, si.c.width, si.c.height);
-    this.segmenter!.segmentForVideo(si.c, ts, (res) => {
+    const [w, h] = this.segSize();
+    if (si.c.width !== w || si.c.height !== h) {
+      si.c.width = w;
+      si.c.height = h;
+    }
+    si.ctx.imageSmoothingQuality = "medium";
+    si.ctx.drawImage(this.video, 0, 0, w, h);
+    this.segMain!.segmentForVideo(si.c, ts, (res) => {
       const masks = res.confidenceMasks;
       if (!masks?.length) return;
-      // multiclase: [fondo, pelo, piel cuerpo, piel cara, ropa, otros] → persona = 1 − fondo
-      const multi = masks.length > 1;
       const m = masks[0];
-      const raw = m.getAsFloat32Array();
-      const data = multi && masks.length >= 6 ? this.personFromClasses(raw, masks[5].getAsFloat32Array(), masks[1].getAsFloat32Array(), masks[3].getAsFloat32Array(), m.width, m.height) : multi ? raw.map((v) => 1 - v) : raw;
-      if (this.gl) {
-        this.gl.setMask(data, m.width, m.height, false);
-        return;
-      }
-      const { width: w, height: h } = m;
-      const mk = this.mask;
-      if (mk.c.width !== w || mk.c.height !== h || !mk.img) {
-        mk.c.width = w;
-        mk.c.height = h;
-        mk.img = mk.ctx.createImageData(w, h);
-        mk.img.data.fill(255);
-        mk.prev = null;
-      }
-      const prev = mk.prev ?? new Float32Array(data);
-      const px = mk.img.data;
-      for (let i = 0; i < data.length; i++) {
-        // suavizado temporal: el borde no tiembla entre cuadros
-        const val = prev[i] * 0.35 + data[i] * 0.65;
-        prev[i] = val;
-        px[i * 4 + 3] = smoothstep(0.3, 0.72, val) * 255;
-      }
-      mk.prev = prev;
-      mk.ctx.putImageData(mk.img, 0, 0);
-      const sf = this.soft;
-      if (sf.c.width !== w || sf.c.height !== h) {
-        sf.c.width = w;
-        sf.c.height = h;
-      }
-      sf.ctx.clearRect(0, 0, w, h);
-      sf.ctx.filter = "blur(0.8px)";
-      sf.ctx.drawImage(mk.c, 0, 0);
-      sf.ctx.filter = "none";
-      mk.ready = true;
+      const { width: mw, height: mh } = m;
+      if (this.mainBytes?.length !== mw * mh) this.mainBytes = new Uint8Array(mw * mh);
+      const out = this.mainBytes;
+      // multiclase: [fondo, pelo, piel cuerpo, piel cara, ropa, otros]
+      if (masks.length >= 6) toBytes(this.cleaner.personFromClasses(m.getAsFloat32Array(), masks[5].getAsFloat32Array(), masks[1].getAsFloat32Array(), masks[3].getAsFloat32Array(), mw, mh), out);
+      else if (masks.length > 1) toBytes(m.getAsFloat32Array(), out, true);
+      else toBytes(m.getAsFloat32Array(), out);
+      this.fpsMasks++;
+      this.useMask(out, mw, mh);
     });
   }
 
-  /**
-   * Persona = 1 − fondo − "otros objetos". La clase "otros" del modelo
-   * multiclase incluye lo que tienes detrás (una silla, un peluche, una
-   * lámpara) y también lo que llevas puesto (gafas, audífonos). Se quita solo
-   * lo que está lejos de tu cabeza: cerca de pelo y cara se conserva.
-   */
-  private personBuf: Float32Array | null = null;
-  private nearBuf: Float32Array | null = null;
-  private personFromClasses(bg: Float32Array, others: Float32Array, hair: Float32Array, face: Float32Array, w: number, h: number): Float32Array {
-    const n = w * h;
-    if (!this.personBuf || this.personBuf.length !== n) {
-      this.personBuf = new Float32Array(n);
-      this.nearBuf = new Float32Array(n);
+  /** Camino 2D: máscara → alfa de un canvas, con suavizado temporal y borde suave. */
+  private mask2d(data: Uint8Array, w: number, h: number) {
+    const mk = this.mask;
+    if (mk.c.width !== w || mk.c.height !== h || !mk.img) {
+      mk.c.width = w;
+      mk.c.height = h;
+      mk.img = mk.ctx.createImageData(w, h);
+      mk.img.data.fill(255);
+      mk.prev = null;
     }
-    const out = this.personBuf;
-    const near = this.nearBuf!;
-    // "cerca de la cabeza": pelo+cara dilatado con una caja separable (suma corrida)
-    const r = Math.max(2, Math.round(w * 0.06));
-    const tmp = out;
-    for (let y = 0; y < h; y++) {
-      let acc = 0;
-      const row = y * w;
-      for (let x = -r; x < w; x++) {
-        const add = x + r < w ? hair[row + x + r] + face[row + x + r] : 0;
-        const sub = x - r - 1 >= 0 ? hair[row + x - r - 1] + face[row + x - r - 1] : 0;
-        acc += add - sub;
-        if (x >= 0) tmp[row + x] = acc;
-      }
+    const prev = mk.prev ?? Float32Array.from(data, (b) => b / 255);
+    const px = mk.img.data;
+    for (let i = 0; i < data.length; i++) {
+      // suavizado temporal: el borde no tiembla entre cuadros
+      const val = prev[i] * 0.35 + (data[i] / 255) * 0.65;
+      prev[i] = val;
+      px[i * 4 + 3] = smoothstep(0.3, 0.72, val) * 255;
     }
-    for (let x = 0; x < w; x++) {
-      let acc = 0;
-      for (let y = -r; y < h; y++) {
-        const add = y + r < h ? tmp[(y + r) * w + x] : 0;
-        const sub = y - r - 1 >= 0 ? tmp[(y - r - 1) * w + x] : 0;
-        acc += add - sub;
-        if (y >= 0) near[y * w + x] = Math.min(1, acc / 6);
-      }
+    mk.prev = prev;
+    mk.ctx.putImageData(mk.img, 0, 0);
+    const sf = this.soft;
+    if (sf.c.width !== w || sf.c.height !== h) {
+      sf.c.width = w;
+      sf.c.height = h;
     }
-    for (let i = 0; i < n; i++) out[i] = Math.max(0, Math.min(1, 1 - bg[i] - others[i] * 0.95 * (1 - near[i])));
-    this.dropIslands(out, near, w, h);
-    this.fillHoles(out, w, h);
-    this.solidFace(out, w, h);
-    return out;
-  }
-
-  /**
-   * Huecos chicos y cerrados dentro de ti (un pliegue de la ropa, un brillo)
-   * se rellenan; los grandes o abiertos al borde (entre el brazo y el torso)
-   * se respetan. Tope: 1,5 % del área de la persona.
-   */
-  private fillHoles(m: Float32Array, w: number, h: number) {
-    const n = w * h;
-    const lab = this.labels!;
-    const st = this.stack!;
-    lab.fill(0);
-    let person = 0;
-    for (let i = 0; i < n; i++) if (m[i] >= 0.4) person++;
-    const maxHole = Math.max(4, person * 0.015);
-    for (let s0 = 0; s0 < n; s0++) {
-      if (lab[s0] || m[s0] >= 0.4) continue;
-      let top = 0;
-      st[top++] = s0;
-      lab[s0] = 1;
-      let count = 0;
-      let border = false;
-      const members: number[] = [];
-      while (top > 0) {
-        const i = st[--top];
-        count++;
-        if (count <= maxHole) members.push(i);
-        const x = i % w;
-        if (x === 0 || x === w - 1 || i < w || i >= n - w) border = true;
-        if (x > 0 && !lab[i - 1] && m[i - 1] < 0.4) {
-          lab[i - 1] = 1;
-          st[top++] = i - 1;
-        }
-        if (x < w - 1 && !lab[i + 1] && m[i + 1] < 0.4) {
-          lab[i + 1] = 1;
-          st[top++] = i + 1;
-        }
-        if (i >= w && !lab[i - w] && m[i - w] < 0.4) {
-          lab[i - w] = 1;
-          st[top++] = i - w;
-        }
-        if (i + w < n && !lab[i + w] && m[i + w] < 0.4) {
-          lab[i + w] = 1;
-          st[top++] = i + w;
-        }
-      }
-      if (!border && count <= maxHole) for (const i of members) m[i] = 1;
-    }
+    sf.ctx.clearRect(0, 0, w, h);
+    sf.ctx.filter = "blur(0.8px)";
+    sf.ctx.drawImage(mk.c, 0, 0);
+    sf.ctx.filter = "none";
+    mk.ready = true;
   }
 
   /** La cara nunca parpadea: dentro del óvalo (algo encogido) siempre es persona. */
-  private solidFace(m: Float32Array, w: number, h: number) {
-    if (!this.landmarks || performance.now() - this.lastFaceAt > 150) return;
+  private solidFace(m: Uint8Array, w: number, h: number) {
+    if (!this.landmarks || performance.now() - this.lastFaceAt > 250) return;
     const box = this.faceBox();
     if (!box) return;
     const sx = w / this.W;
     const sy = h / this.H;
-    const cx = (box.x + box.w / 2) * sx;
-    const cy = (box.y + box.h / 2) * sy;
-    const rx = (box.w / 2) * sx * 0.82;
-    const ry = (box.h / 2) * sy * 0.86;
-    const x0 = Math.max(0, Math.floor(cx - rx));
-    const x1 = Math.min(w - 1, Math.ceil(cx + rx));
-    const y0 = Math.max(0, Math.floor(cy - ry));
-    const y1 = Math.min(h - 1, Math.ceil(cy + ry));
-    for (let y = y0; y <= y1; y++) {
-      const dy = (y + 0.5 - cy) / ry;
-      for (let x = x0; x <= x1; x++) {
-        const dx = (x + 0.5 - cx) / rx;
-        if (dx * dx + dy * dy < 1) m[y * w + x] = 1;
+    solidEllipse(m, w, h, (box.x + box.w / 2) * sx, (box.y + box.h / 2) * sy, (box.w / 2) * sx * 0.82, (box.h / 2) * sy * 0.86);
+  }
+
+  // ----- cara -----
+
+  private requestFace(ts: number) {
+    if (this.frame % this.faceEvery !== 0) return;
+    const link = this.faceLink;
+    if (link?.state === "ready") {
+      if (link.busy) {
+        link.watchdog();
+        return;
       }
+      const k = Math.min(1, FACE_INPUT / Math.max(1, Math.max(this.W, this.H)));
+      const w = Math.max(2, Math.round(this.W * k));
+      const h = Math.max(2, Math.round(this.H * k));
+      if (!this.faceOut) {
+        const c = new OffscreenCanvas(w, h);
+        const ctx = c.getContext("2d");
+        if (!ctx) return;
+        this.faceOut = { c, ctx };
+      }
+      const fo = this.faceOut;
+      if (fo.c.width !== w || fo.c.height !== h) {
+        fo.c.width = w;
+        fo.c.height = h;
+      }
+      fo.ctx.drawImage(this.video, 0, 0, w, h);
+      const bmp = fo.c.transferToImageBitmap();
+      if (!link.send(this.frame, ts, bmp)) bmp.close();
+      return;
+    }
+    if (this.faceMain) {
+      const res = this.faceMain.detectForVideo(this.video, ts);
+      const lm = res.faceLandmarks?.[0];
+      const pts = lm && lm.length >= 478 ? lm.map((p) => ({ x: p.x * this.W, y: p.y * this.H })) : null;
+      this.onLandmarks(pts, res.facialTransformationMatrixes?.[0]?.data ?? null, this.frame);
     }
   }
 
-  /**
-   * Quita islas: trozos sueltos que el modelo cree "persona" pero no están
-   * unidos a tu cabeza (un reflejo, un cuadro, la esquina de un mueble). Se
-   * conservan las regiones conectadas a la cabeza y, si no hay cabeza a la
-   * vista, la más grande. 4-vecindad sobre la máscara a 0,4.
-   */
-  private labels: Int32Array | null = null;
-  private stack: Int32Array | null = null;
-  private dropIslands(m: Float32Array, near: Float32Array, w: number, h: number) {
-    const n = w * h;
-    if (!this.labels || this.labels.length !== n) {
-      this.labels = new Int32Array(n);
-      this.stack = new Int32Array(n);
+  private onFaceResult(r: FaceResult) {
+    if (this.destroyed) return;
+    const p = r.points;
+    if (!p) {
+      this.onLandmarks(null, null, r.id);
+      return;
     }
-    const lab = this.labels;
-    const st = this.stack!;
-    lab.fill(0);
-    const keep: boolean[] = [false];
-    const area: number[] = [0];
-    let next = 1;
-    let anyHead = false;
-    for (let s0 = 0; s0 < n; s0++) {
-      if (lab[s0] || m[s0] < 0.4) continue;
-      const id = next++;
-      let top = 0;
-      st[top++] = s0;
-      lab[s0] = id;
-      let count = 0;
-      let head = false;
-      while (top > 0) {
-        const i = st[--top];
-        count++;
-        if (near[i] > 0.35) head = true;
-        const x = i % w;
-        // vecinos sin crear arrays (esto corre ~150 000 veces por cuadro)
-        if (x > 0 && !lab[i - 1] && m[i - 1] >= 0.4) {
-          lab[i - 1] = id;
-          st[top++] = i - 1;
-        }
-        if (x < w - 1 && !lab[i + 1] && m[i + 1] >= 0.4) {
-          lab[i + 1] = id;
-          st[top++] = i + 1;
-        }
-        if (i >= w && !lab[i - w] && m[i - w] >= 0.4) {
-          lab[i - w] = id;
-          st[top++] = i - w;
-        }
-        if (i + w < n && !lab[i + w] && m[i + w] >= 0.4) {
-          lab[i + w] = id;
-          st[top++] = i + w;
-        }
-      }
-      keep[id] = head;
-      area[id] = count;
-      if (head) anyHead = true;
-    }
-    if (!anyHead) {
-      let big = 0;
-      for (let id = 1; id < next; id++) if (area[id] > (area[big] ?? 0)) big = id;
-      if (big) keep[big] = true;
-    } else {
-      // partes grandes separadas de la cabeza (una mano que entra por el
-      // borde con el brazo fuera de cuadro) también se quedan
-      let headArea = 0;
-      for (let id = 1; id < next; id++) if (keep[id]) headArea = Math.max(headArea, area[id]);
-      for (let id = 1; id < next; id++) if (!keep[id] && area[id] >= headArea * 0.15) keep[id] = true;
-    }
-    // islas fuera; el borde suave (valores < 0,4) junto a una isla también
-    for (let i = 0; i < n; i++) {
-      const id = lab[i];
-      if (id && !keep[id]) m[i] = 0;
-      else if (!id && m[i] > 0) {
-        const x = i % w;
-        const l = x > 0 ? lab[i - 1] : 0;
-        const r = x < w - 1 ? lab[i + 1] : 0;
-        const u = i >= w ? lab[i - w] : 0;
-        const d = i + w < n ? lab[i + w] : 0;
-        const touchesKept = (l && keep[l]) || (r && keep[r]) || (u && keep[u]) || (d && keep[d]);
-        if (!touchesKept && (l || r || u || d)) m[i] = 0;
-      }
-    }
+    const n = p.length / 2;
+    const pts: Pt[] = new Array(n);
+    for (let i = 0; i < n; i++) pts[i] = { x: p[i * 2] * this.W, y: p[i * 2 + 1] * this.H };
+    this.onLandmarks(pts, r.pose, r.id);
   }
 
-  private detectFace(ts: number) {
-    const res = this.face!.detectForVideo(this.video, ts);
-    const lm = res.faceLandmarks?.[0];
-    if (!lm || lm.length < 478) {
+  /** Puntos de la cara del cuadro `id` (o null si no hay cara) y la pose de la cabeza. */
+  private onLandmarks(pts: Pt[] | null, poseMatrix: ArrayLike<number> | null, id: number) {
+    if (!pts) {
       if (++this.faceMiss > 4) {
         this.landmarks = null;
         this.eyes = null;
+        this.eyeHist = [];
         this.reading = null;
+        this.meter.lost();
       }
       return;
     }
+    const now = performance.now();
     this.faceMiss = 0;
-    this.lastFaceAt = performance.now();
-    this.landmarks = toPx(lm, this.W, this.H);
-    const g = gazeOf(this.landmarks);
+    this.lastFaceAt = now;
+    this.landmarks = pts;
+    const g = gazeOf(pts);
     if (!g) return;
     this.eyes = g.eyes;
-    this.gazeSmooth = smoothGaze(this.gazeSmooth, g.gaze);
+    this.eyeHist.push({ id, eyes: g.eyes });
+    if (this.eyeHist.length > 2) this.eyeHist.shift();
+    // la mirada respecto al lente: iris + hacia dónde apunta la cabeza
+    const pose = headPose(poseMatrix);
+    if (pose) this.poseSeen = true;
+    else if (this.poseSeen) return; // sin pose esta muestra no es comparable con las demás
+    const gaze = gazeToCamera(g.gaze, pose);
+    this.reading = this.meter.push(gaze, g.open, now, this.calibration);
     if (this.calibrator) {
-      this.calibrator.add(g.gaze);
-      if (performance.now() >= this.calibrateUntil) {
-        this.calibration = this.calibrator.result() ?? this.calibration;
+      if (!this.meter.blinking) this.calibrator.add(gaze);
+      if (now >= this.calibrateUntil) {
+        const cal = this.calibrator.result();
         this.calibrator = null;
+        if (cal) {
+          this.calibration = cal;
+          saveGazeCalibration(cal);
+          this.calibFailedAt = 0;
+        } else {
+          // no miraste fijo (o no hubo cara): mejor conservar la referencia anterior
+          this.calibFailedAt = now;
+        }
         this.resetGazeStats();
         this.notify();
       }
-    }
-    this.reading = readGaze(this.gazeSmooth, this.calibration);
-    if (this.calibration) {
-      this.gazeFrames++;
-      if (this.reading.onCamera) this.gazeOnFrames++;
     }
   }
 
@@ -861,27 +1348,22 @@ export class VideoCompositor {
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
   }
 
-  /** Luminancia media de la cara (o del centro) → ganancia suavizada. */
-  private updateExposure() {
+  // ----- luz -----
+
+  /** Dónde medir la luz: el centro de la cara o, sin cara, el tercio central. */
+  private meterRegion(): { x: number; y: number; w: number; h: number } {
     const box = this.faceBox();
     // centro de la cara (mejillas, nariz): sin pelo ni fondo que engañen la medida;
     // sin cara, el tercio central, donde suele estar quien habla
-    const r = box ? { x: box.x + box.w * 0.25, y: box.y + box.h * 0.3, w: box.w * 0.5, h: box.h * 0.45 } : { x: this.W / 3, y: this.H / 4, w: this.W / 3, h: this.H / 2 };
-    this.updateWhiteBalance();
-    const { ctx } = this.probe;
-    ctx.drawImage(this.video, r.x, r.y, r.w, r.h, 0, 0, 24, 24);
-    const d = ctx.getImageData(0, 0, 24, 24).data;
-    let sum = 0;
-    for (let i = 0; i < d.length; i += 4) sum += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
-    const target = exposureGain(sum / (d.length / 4));
-    this.gain += (target - this.gain) * 0.2;
+    return box ? { x: box.x + box.w * 0.25, y: box.y + box.h * 0.3, w: box.w * 0.5, h: box.h * 0.45 } : { x: this.W / 3, y: this.H / 4, w: this.W / 3, h: this.H / 2 };
   }
 
-  /** Balance de blancos "gray-world" suave: corrige la mitad del tinte de la escena. */
-  private updateWhiteBalance() {
-    const { ctx } = this.wbProbe;
-    ctx.drawImage(this.video, 0, 0, 16, 9);
-    const d = ctx.getImageData(0, 0, 16, 9).data;
+  /**
+   * Luz y balance de blancos a partir de la miniatura que saca la GPU sin
+   * bloquear (gl.requestProbe). Dibujar el video en un canvas de CPU para
+   * medirlo costaba ~30 ms cada vez: el navegador baja el cuadro entero.
+   */
+  private readProbe(d: Uint8Array) {
     let r = 0;
     let g = 0;
     let b = 0;
@@ -890,9 +1372,52 @@ export class VideoCompositor {
       g += d[i + 1];
       b += d[i + 2];
     }
+    this.whiteBalance(r, g, b);
+    const m = this.meterRegion();
+    const x0 = Math.max(0, Math.min(PROBE_W - 1, Math.floor((m.x / this.W) * PROBE_W)));
+    const y0 = Math.max(0, Math.min(PROBE_H - 1, Math.floor((m.y / this.H) * PROBE_H)));
+    const x1 = Math.max(x0 + 1, Math.min(PROBE_W, Math.ceil(((m.x + m.w) / this.W) * PROBE_W)));
+    const y1 = Math.max(y0 + 1, Math.min(PROBE_H, Math.ceil(((m.y + m.h) / this.H) * PROBE_H)));
+    let sum = 0;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * PROBE_W + x) * 4;
+        sum += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+      }
+    }
+    const target = exposureGain(sum / ((x1 - x0) * (y1 - y0)));
+    this.gain += (target - this.gain) * 0.2;
+  }
+
+  /** Balance de blancos "gray-world" suave: corrige la mitad del tinte de la escena. */
+  private whiteBalance(r: number, g: number, b: number) {
     const l = (r + g + b) / 3 || 1;
     const target = [r, g, b].map((c) => Math.max(0.88, Math.min(1.15, Math.pow(l / Math.max(1, c), 0.5)))) as [number, number, number];
     for (let k = 0; k < 3; k++) this.wb[k] += (target[k] - this.wb[k]) * 0.15;
+  }
+
+  /** Camino 2D (sin WebGL2): luminancia media de la cara → ganancia suavizada. */
+  private updateExposure() {
+    const r = this.meterRegion();
+    const wb = this.wbProbe.ctx;
+    wb.drawImage(this.video, 0, 0, 16, 9);
+    const w = wb.getImageData(0, 0, 16, 9).data;
+    let cr = 0;
+    let cg = 0;
+    let cb = 0;
+    for (let i = 0; i < w.length; i += 4) {
+      cr += w[i];
+      cg += w[i + 1];
+      cb += w[i + 2];
+    }
+    this.whiteBalance(cr, cg, cb);
+    const { ctx } = this.probe;
+    ctx.drawImage(this.video, r.x, r.y, r.w, r.h, 0, 0, 24, 24);
+    const d = ctx.getImageData(0, 0, 24, 24).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+    const target = exposureGain(sum / (d.length / 4));
+    this.gain += (target - this.gain) * 0.2;
   }
 
   /** Luz de estudio: centro y radio de la cara en coordenadas 0–1. */
@@ -912,12 +1437,14 @@ export class VideoCompositor {
     return `brightness(${this.gain.toFixed(3)}) contrast(1.05) saturate(1.08)`;
   }
 
+  // ----- pintar -----
+
   /** Camino GPU: fondo y persona en WebGL2; retoque y ojos encima en 2D. */
   private drawGl(wantSeg: boolean) {
     const gl = this.gl!;
     const mode = !wantSeg ? 0 : this.bg.kind === "blur" ? 1 : this.bg.kind === "preset" || this.bg.kind === "custom" ? 2 : 0;
     const light = this.fx.light;
-    gl.render(this.video, {
+    gl.render({
       mode,
       blurPx: blurPx(this.look.blurAmount, this.H),
       gain: light ? this.gain : 1,
@@ -929,11 +1456,26 @@ export class VideoCompositor {
       sharpen: this.fx.sharpen ? 0.55 : 0,
       key: this.keyLight(),
       style: this.fx.style ?? "natural",
+      quality: this.profile.quality,
+      eyes: this.eyeWarps(this.glFrame).map(({ e, shift }): EyeWarp => ({
+        cx: e.center.x,
+        cy: e.center.y,
+        cos: Math.cos(e.angle),
+        sin: Math.sin(e.angle),
+        ax: e.width / 2,
+        ay: Math.max(1, e.open / 2),
+        irisX: e.iris.x,
+        irisY: e.iris.y,
+        irisR: e.irisR,
+        reach: irisReach(e),
+        shiftX: shift.x,
+        shiftY: shift.y,
+      })),
     });
     this.ctx.drawImage(gl.canvas, 0, 0);
-    const filter = this.filter();
-    if (this.fx.beauty && this.landmarks) this.drawBeauty(filter);
-    if (this.fx.eyeContact && this.calibration && this.eyes && this.reading && !this.calibrator) this.drawEyeContact();
+    // el retoque parte del cuadro ya compuesto (con su luz), no del video: con
+    // el fondo activo el video va un cuadro por delante de lo que se pinta
+    if (this.fx.beauty && this.landmarks) this.drawBeauty(gl.canvas, "none");
   }
 
   private draw(withMask: boolean) {
@@ -973,8 +1515,8 @@ export class VideoCompositor {
       ctx.drawImage(this.person.c, 0, 0);
     }
 
-    if (this.fx.beauty && this.landmarks) this.drawBeauty(filter);
-    if (this.fx.eyeContact && this.calibration && this.eyes && this.reading && !this.calibrator) this.drawEyeContact();
+    if (this.fx.beauty && this.landmarks) this.drawBeauty(video, filter);
+    this.drawEyeContact();
   }
 
   private drawCover(img: CanvasImageSource) {
@@ -988,7 +1530,7 @@ export class VideoCompositor {
   }
 
   /** Piel más pareja: mezcla una versión suavizada de la cara, sin ojos, cejas ni boca. */
-  private drawBeauty(filter: string) {
+  private drawBeauty(source: CanvasImageSource, filter: string) {
     const lm = this.landmarks!;
     const box = this.faceBox();
     if (!box) return;
@@ -1005,7 +1547,7 @@ export class VideoCompositor {
     ctx.clip(path, "evenodd");
     ctx.globalAlpha = 0.42;
     ctx.filter = `${filter === "none" ? "" : filter + " "}blur(${radius}px)`;
-    ctx.drawImage(this.video, box.x, box.y, box.w, box.h, box.x, box.y, box.w, box.h);
+    ctx.drawImage(source, box.x, box.y, box.w, box.h, box.x, box.y, box.w, box.h);
     ctx.restore();
   }
 
@@ -1014,23 +1556,67 @@ export class VideoCompositor {
     { x: 0, y: 0 },
     { x: 0, y: 0 },
   ];
+  private eyeVel: [Pt, Pt] = [
+    { x: 0, y: 0 },
+    { x: 0, y: 0 },
+  ];
+  private eyeAt = 0;
 
-  /** Beta: mueve cada iris hacia la cámara con un warp local del ojo. */
+  /**
+   * Corrección de mirada (beta): qué ojos mover y cuánto en el cuadro `frameId`.
+   *
+   * Los puntos de la cara llegan del worker uno o dos cuadros después que la
+   * imagen. Quieto da igual; moviéndote, el ojo ya no está donde dicen, y un
+   * warp fuera de sitio mueve piel en vez de iris. Dos defensas: los ojos se
+   * llevan a donde estarán en ese cuadro (con la velocidad de las dos últimas
+   * detecciones), y si la cabeza va rápido la corrección se apaga sola y
+   * vuelve al parar, que es justo cuando el contacto visual importa.
+   */
+  private eyeWarps(frameId: number): { e: EyeGeom; shift: Pt }[] {
+    const now = performance.now();
+    const dt = this.eyeAt ? Math.min(100, now - this.eyeAt) : 16;
+    this.eyeAt = now;
+    const h = this.eyeHist;
+    const b = h[h.length - 1];
+    const active = this.fx.eyeContact && !!this.calibration && !!this.reading && !this.calibrator && !!b && frameId - b.id <= 6;
+    const a = h.length > 1 ? h[0] : null;
+    const span = a && b ? b.id - a.id : 0;
+    const lead = b ? Math.max(-1, Math.min(3, frameId - b.id)) : 0;
+    const turn = active ? headTurnFade(b.eyes[0], b.eyes[1]) : 0;
+    const out: { e: EyeGeom; shift: Pt }[] = [];
+    for (let k = 0; k < 2; k++) {
+      const sm = this.eyeShiftSm[k];
+      let target = { x: 0, y: 0 };
+      let e: EyeGeom | null = null;
+      if (active) {
+        e = b.eyes[k];
+        const vel = this.eyeVel[k];
+        if (a && span > 0 && span <= 4) {
+          vel.x += ((e.center.x - a.eyes[k].center.x) / span - vel.x) * 0.6;
+          vel.y += ((e.center.y - a.eyes[k].center.y) / span - vel.y) * 0.6;
+        } else vel.x = vel.y = 0;
+        // anchos de ojo por cuadro; por debajo de 0,02 es el temblor de la detección, no movimiento
+        const speed = Math.hypot(vel.x, vel.y) / e.width;
+        if (speed > 0.02) e = movedEye(e, vel.x * lead, vel.y * lead);
+        const still = 1 - Math.max(0, Math.min(1, (speed - 0.06) / 0.16));
+        const raw = eyeShift(e, this.reading!);
+        if (raw) target = { x: raw.x * turn * still, y: raw.y * turn * still };
+      }
+      // al parpadear o mirar lejos se suelta rápido; al volver entra suave
+      const tau = Math.hypot(target.x, target.y) < Math.hypot(sm.x, sm.y) ? 45 : 90;
+      const alpha = 1 - Math.exp(-dt / tau);
+      sm.x += (target.x - sm.x) * alpha;
+      sm.y += (target.y - sm.y) * alpha;
+      if (!e || (Math.abs(sm.x) < 0.3 && Math.abs(sm.y) < 0.3)) continue;
+      out.push({ e, shift: { x: sm.x, y: sm.y } });
+    }
+    return out;
+  }
+
+  /** Camino sin WebGL2: el mismo warp, en CPU, sobre el canvas ya pintado. */
   private drawEyeContact() {
     const { ctx } = this;
-    const eyes = this.eyes!;
-    const turn = headTurnFade(eyes[0], eyes[1]);
-    for (let k = 0; k < 2; k++) {
-      const e = eyes[k];
-      const raw = eyeShift(e, this.reading!);
-      const target = raw ? { x: raw.x * turn, y: raw.y * turn } : { x: 0, y: 0 };
-      // al parpadear o mirar lejos se suelta rápido; al volver entra suave
-      const a = Math.hypot(target.x, target.y) < Math.hypot(this.eyeShiftSm[k].x, this.eyeShiftSm[k].y) ? 0.5 : 0.3;
-      const sm = this.eyeShiftSm[k];
-      sm.x += (target.x - sm.x) * a;
-      sm.y += (target.y - sm.y) * a;
-      const shift = { x: sm.x, y: sm.y };
-      if (Math.abs(shift.x) < 0.3 && Math.abs(shift.y) < 0.3) continue;
+    for (const { e, shift } of this.eyeWarps(this.frame)) {
       const roi = eyeRoi(e, this.W, this.H);
       if (roi.w < 6 || roi.h < 4) continue;
       const buf = this.eyeBuf;
@@ -1041,14 +1627,7 @@ export class VideoCompositor {
       buf.ctx.drawImage(this.canvas, roi.x, roi.y, roi.w, roi.h, 0, 0, roi.w, roi.h);
       const src = buf.ctx.getImageData(0, 0, roi.w, roi.h);
       const dst = buf.ctx.createImageData(roi.w, roi.h);
-      const local: EyeGeom = {
-        ...e,
-        a: { x: e.a.x - roi.x, y: e.a.y - roi.y },
-        b: { x: e.b.x - roi.x, y: e.b.y - roi.y },
-        center: { x: e.center.x - roi.x, y: e.center.y - roi.y },
-        iris: { x: e.iris.x - roi.x, y: e.iris.y - roi.y },
-      };
-      warpEye(src.data, dst.data, roi.w, roi.h, local, shift);
+      warpEye(src.data, dst.data, roi.w, roi.h, movedEye(e, -roi.x, -roi.y), shift);
       buf.ctx.putImageData(dst, 0, 0);
       ctx.drawImage(buf.c, roi.x, roi.y);
     }

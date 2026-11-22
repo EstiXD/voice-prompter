@@ -7,6 +7,7 @@ import type { Recording } from "@/hooks/useRecorder";
 import { EXPORT_FORMATS, formatInfo, VIDEO_EXPORT_FORMATS, videoFormatInfo, type ExportFormat, type VideoExportFormat } from "@/lib/audio/formats";
 import { convertRecording, convertVideo } from "@/lib/audio/convert";
 import { downloadBlob, formatBytes, formatDuration, takeFilename } from "@/lib/audio/download";
+import type { GazeDirection } from "@/lib/video/compositor";
 
 type Props = {
   recording: Recording | null;
@@ -14,6 +15,8 @@ type Props = {
   wordsTotal: number;
   /** % del tiempo mirando a cámara (modo cámara con medidor); null = no medido */
   gazePct?: number | null;
+  /** hacia dónde se fue la mirada cuando no estuvo en el lente */
+  gazeTendency?: GazeDirection | null;
   format: ExportFormat;
   onFormat: (f: ExportFormat) => void;
   videoFormat: VideoExportFormat;
@@ -22,7 +25,17 @@ type Props = {
   onEdit: () => void;
 };
 
-export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null, format, onFormat, videoFormat, onVideoFormat, onNewTake, onEdit }: Props) {
+/** Qué hacer la próxima toma, según cuánto y hacia dónde se fue la mirada. */
+function gazeAdvice(pct: number, tendency: GazeDirection | null): string {
+  if (pct >= 75) return "Miraste a cámara casi todo el tiempo: no se nota que lees.";
+  const lead = pct >= 50 ? "Se nota un poco que lees." : "Se nota que lees.";
+  if (tendency === "abajo") return `${lead} Tu mirada caía por debajo del lente: sube la tarjeta hasta pegarla a la cámara y déjala en 2–3 líneas.`;
+  if (tendency === "arriba") return `${lead} Tu mirada se iba por encima del lente: baja un poco la tarjeta, o vuelve a calibrar mirando fijo al lente.`;
+  if (tendency === "derecha" || tendency === "izquierda") return `${lead} Tu mirada barría de lado a lado: haz la tarjeta más angosta y céntrala bajo el lente.`;
+  return pct >= 50 ? `${lead} Acerca la tarjeta al lente y hazla más angosta.` : `${lead} Pon la tarjeta pegada al lente, angosta (2–3 líneas) y la letra un poco más grande.`;
+}
+
+export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null, gazeTendency = null, format, onFormat, videoFormat, onVideoFormat, onNewTake, onEdit }: Props) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const cacheRef = useRef(new Map<string, Blob>());
@@ -111,15 +124,7 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
                 </div>
               ))}
             </dl>
-            {gazePct !== null && (
-              <p className="mt-2 text-center text-xs text-paper-dim">
-                {gazePct >= 75
-                  ? "Miraste a cámara casi todo el tiempo: no se nota que lees."
-                  : gazePct >= 50
-                    ? "Se nota un poco que lees. Acerca la tarjeta al lente y hazla más angosta."
-                    : "Se nota que lees. Pon la tarjeta pegada al lente, angosta (2–3 líneas) y la letra un poco más grande."}
-              </p>
-            )}
+            {gazePct !== null && <p className="mt-2 text-center text-xs text-paper-dim">{gazeAdvice(gazePct, gazeTendency)}</p>}
             <p className="mt-2 text-center text-xs text-paper-mute">
               {wordsRead > 0 ? `${wordsRead} de ${wordsTotal} palabras · grabado en ${recording.label}` : `Grabado en ${recording.label}`}
             </p>

@@ -87,24 +87,103 @@ export function irisOffset(e: EyeGeom): Gaze {
 }
 
 /**
- * Mirada de la cara en coordenadas de imagen (h > 0 = el iris se mueve hacia
- * la derecha de la imagen, v > 0 = hacia abajo). Promedia ambos ojos; los ejes
+ * Posición del iris dentro de los ojos, en coordenadas de imagen (h > 0 = el
+ * iris se mueve hacia la derecha de la imagen, v > 0 = hacia abajo). Los ejes
  * de los dos ojos apuntan en sentidos opuestos (externa → interna), así que el
- * izquierdo se invierte.
+ * izquierdo se invierte. Cada ojo pesa según lo ancho que se ve: con la cabeza
+ * girada, el ojo del lado lejano sale angosto y su medida vale menos.
+ *
+ * OJO: esto es la mirada RESPECTO A LA CABEZA. Para saber si miras al lente
+ * hay que sumarle hacia dónde apunta la cabeza: ver `gazeToCamera`.
+ * `open` = apertura del ojo más cerrado (alto/ancho): baja al parpadear.
  */
-export function gazeOf(px: readonly Pt[]): { gaze: Gaze; eyes: [EyeGeom, EyeGeom] } | null {
+export function gazeOf(px: readonly Pt[]): { gaze: Gaze; eyes: [EyeGeom, EyeGeom]; open: number } | null {
   const r = eyeGeom(px, "R");
   const l = eyeGeom(px, "L");
   if (!r || !l) return null;
   const or = irisOffset(r);
   const ol = irisOffset(l);
+  const wr = r.width / (r.width + l.width);
+  const wl = 1 - wr;
   // R: externa(33) está a la izquierda de la imagen → eje apunta a la derecha.
   // L: externa(263) a la derecha → eje apunta a la izquierda: al rotar por su
   // ángulo (~π) se invierten los dos ejes, así que h y v del izquierdo cambian de signo.
-  return { gaze: { h: (or.h - ol.h) / 2, v: (or.v - ol.v) / 2 }, eyes: [r, l] };
+  return { gaze: { h: or.h * wr - ol.h * wl, v: or.v * wr - ol.v * wl }, eyes: [r, l], open: Math.min(r.open / r.width, l.open / l.width) };
 }
 
+// ----- pose de la cabeza -----
+
+/**
+ * Hacia dónde apunta la cabeza y dónde queda el lente visto desde ella, en
+ * radianes y en el espacio de la cámara (X = derecha de la imagen, Y = arriba,
+ * la cámara mira hacia −Z). `yaw` > 0: la cara gira hacia la derecha de la
+ * imagen; `pitch` > 0: mira hacia arriba.
+ */
+export type HeadPose = { yaw: number; pitch: number; camYaw: number; camPitch: number };
+
+/**
+ * Pose a partir de la matriz 4×4 (por columnas) de MediaPipe Face Landmarker:
+ * la tercera columna es hacia dónde mira la cara y la cuarta, dónde está la
+ * cabeza (cm). Devuelve null si el dato no es fiable (cara casi de perfil).
+ */
+export function headPose(m: ArrayLike<number> | null | undefined): HeadPose | null {
+  if (!m || m.length < 16) return null;
+  const fx = m[8];
+  const fy = m[9];
+  const fz = m[10];
+  const tx = m[12];
+  const ty = m[13];
+  const tz = m[14];
+  if (!(fz > 0.35) || !(tz < 0) || ![fx, fy, tx, ty].every(Number.isFinite)) return null;
+  return {
+    yaw: Math.atan2(fx, fz),
+    pitch: Math.atan2(fy, Math.hypot(fx, fz)),
+    // para mirar al lente, la mirada tiene que apuntar de la cabeza a la cámara (el origen)
+    camYaw: Math.atan2(-tx, -tz),
+    camPitch: Math.atan2(-ty, Math.hypot(tx, tz)),
+  };
+}
+
+/**
+ * Cuánto se desplaza el iris (en anchos de ojo) por cada radián que gira el
+ * ojo. En horizontal sale de la anatomía —el iris está a ~11 mm del centro de
+ * giro del globo y el ojo mide ~29 mm de comisura a comisura: 0,38— y medido
+ * con una webcam real da 0,37 (tramos en que la persona fija la vista y mueve
+ * la cabeza: el iris se corre al revés que la cabeza, siempre). En vertical
+ * los párpados tapan parte del iris y su centro se mide de menos: ~0,3.
+ */
+export const EYE_GAIN = { h: 0.38, v: 0.3 };
+
+/**
+ * Mirada respecto al LENTE, en las mismas unidades que el iris (anchos de
+ * ojo): h > 0 = miras a la derecha del lente en la imagen, v > 0 = por debajo.
+ *
+ * El iris solo dice hacia dónde miran los ojos dentro de la cabeza. Si giras
+ * la cabeza 6° sin dejar de mirar al lente, los ojos giran 6° al revés para
+ * compensar y el iris se corre 0,04 anchos: justo el umbral de "se nota que
+ * lees". Sumando el giro de la cabeza (y dónde queda el lente desde donde
+ * estás sentado) ese movimiento se cancela, como debe ser. Sin pose (null)
+ * se devuelve el iris tal cual.
+ */
+export function gazeToCamera(iris: Gaze, pose: HeadPose | null): Gaze {
+  if (!pose) return iris;
+  return {
+    h: iris.h + EYE_GAIN.h * (pose.yaw - pose.camYaw),
+    v: iris.v - EYE_GAIN.v * (pose.pitch - pose.camPitch),
+  };
+}
+
+// ----- calibración -----
+
 export type GazeCalibration = { h: number; v: number; samples: number };
+
+/** dispersión máxima (desviación absoluta mediana, anchos de ojo) para dar por buena una calibración */
+const CALIB_MAX_SPREAD = 0.022;
+
+const median = (a: number[]) => {
+  const s = [...a].sort((x, y) => x - y);
+  return s[Math.floor(s.length / 2)];
+};
 
 export class GazeCalibrator {
   private hs: number[] = [];
@@ -116,35 +195,265 @@ export class GazeCalibrator {
   get count() {
     return this.hs.length;
   }
-  /** mediana: robusta a parpadeos durante la calibración */
+  /**
+   * Mediana (robusta a un parpadeo suelto). Devuelve null si hubo pocas
+   * muestras o si la mirada anduvo de un lado a otro: calibrar con eso fija
+   * como "mirar al lente" un punto que no lo es, y es peor que no calibrar.
+   */
   result(): GazeCalibration | null {
     if (this.hs.length < 8) return null;
-    const med = (a: number[]) => {
-      const s = [...a].sort((x, y) => x - y);
-      return s[Math.floor(s.length / 2)];
-    };
-    return { h: med(this.hs), v: med(this.vs), samples: this.hs.length };
+    const h = median(this.hs);
+    const v = median(this.vs);
+    const spreadH = median(this.hs.map((x) => Math.abs(x - h)));
+    const spreadV = median(this.vs.map((x) => Math.abs(x - v)));
+    if (spreadH > CALIB_MAX_SPREAD || spreadV > CALIB_MAX_SPREAD) return null;
+    return { h, v, samples: this.hs.length };
   }
 }
 
-/** Umbrales del medidor: dentro = se percibe mirando a cámara. */
-export const GAZE_OK = { h: 0.045, v: 0.035 };
+// ----- lectura -----
 
-export type GazeReading = { dh: number; dv: number; onCamera: boolean; score: number };
+/**
+ * Umbrales del medidor (anchos de ojo; 0,045 ≈ 7°): dentro = se percibe
+ * mirando a cámara. Hacia abajo se tolera más que hacia arriba: quien ve el
+ * video nota mucho menos una mirada que cae un poco bajo el lente que una que
+ * se va por encima o a los lados (Chen, 2002, "Leveraging the asymmetric
+ * sensitivity of eye contact for videoconferencing").
+ */
+export const GAZE_OK = { h: 0.045, up: 0.03, down: 0.05 };
+
+/** Distancia de la mirada al lente en "radios de mirar a cámara" (≤ 1 = dentro). */
+export function gazeDistance(dh: number, dv: number): number {
+  return Math.hypot(dh / GAZE_OK.h, dv / (dv > 0 ? GAZE_OK.down : GAZE_OK.up));
+}
+
+/** Hacia dónde se va la mirada cuando no está en el lente (en la imagen sin espejo). */
+export type GazeDirection = "abajo" | "arriba" | "derecha" | "izquierda";
+
+export function gazeDirection(dh: number, dv: number): GazeDirection {
+  if (Math.abs(dv) / (dv > 0 ? GAZE_OK.down : GAZE_OK.up) >= Math.abs(dh) / GAZE_OK.h) return dv > 0 ? "abajo" : "arriba";
+  return dh > 0 ? "derecha" : "izquierda";
+}
+
+export type GazeReading = {
+  /** desviación respecto al lente (anchos de ojo) */
+  dh: number;
+  dv: number;
+  /** distancia en radios de "mirar a cámara" */
+  dist: number;
+  /** ¿se percibe mirando a cámara? (con histéresis si viene de GazeMeter) */
+  onCamera: boolean;
+  score: number;
+};
 
 export function readGaze(g: Gaze, cal: GazeCalibration | null): GazeReading {
   const dh = g.h - (cal?.h ?? 0);
   const dv = g.v - (cal?.v ?? 0);
-  const nh = dh / GAZE_OK.h;
-  const nv = dv / GAZE_OK.v;
-  const dist = Math.hypot(nh, nv);
-  return { dh, dv, onCamera: dist <= 1, score: Math.max(0, 1 - dist / 3) };
+  const dist = gazeDistance(dh, dv);
+  return { dh, dv, dist, onCamera: dist <= 1, score: Math.max(0, 1 - dist / 3) };
 }
 
 /** Suavizado exponencial de la mirada (el iris tiembla cuadro a cuadro). */
 export function smoothGaze(prev: Gaze | null, next: Gaze, alpha = 0.45): Gaze {
   if (!prev) return next;
   return { h: prev.h + (next.h - prev.h) * alpha, v: prev.v + (next.v - prev.v) * alpha };
+}
+
+/**
+ * Filtro "One Euro" (Casiez et al., 2012): quieto, filtra fuerte (el iris
+ * tiembla un par de centésimas de cuadro a cuadro); en un movimiento rápido
+ * (una sacada del ojo) abre el filtro y casi no retrasa. Trabaja con tiempos
+ * reales, así que da igual a cuántos cuadros por segundo llegue la cara.
+ */
+export class OneEuro {
+  private x: number | null = null;
+  private dx = 0;
+  private t = 0;
+  private readonly minCutoff: number;
+  private readonly beta: number;
+  private readonly dCutoff: number;
+
+  constructor(minCutoff = 1.2, beta = 4, dCutoff = 1) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+  }
+
+  reset(): void {
+    this.x = null;
+  }
+
+  filter(v: number, tMs: number): number {
+    if (this.x === null || tMs - this.t > 600) {
+      // primera muestra o un hueco largo (no había cara): empezar de nuevo
+      this.x = v;
+      this.dx = 0;
+      this.t = tMs;
+      return v;
+    }
+    const dt = Math.max(1e-3, (tMs - this.t) / 1000);
+    this.t = tMs;
+    const alpha = (cutoff: number) => 1 / (1 + 1 / (2 * Math.PI * cutoff * dt));
+    this.dx += ((v - this.x) / dt - this.dx) * alpha(this.dCutoff);
+    this.x += (v - this.x) * alpha(this.minCutoff + this.beta * Math.abs(this.dx));
+    return this.x;
+  }
+}
+
+export const GAZE_METER = {
+  /** se entra a "mirando a cámara" con distancia ≤ 1 y se sale por encima de esto */
+  EXIT: 1.3,
+  /** cuánto debe durar el cambio para creérselo (ms): una sacada suelta no cuenta */
+  DWELL_MS: 140,
+  /** apertura por debajo de esta fracción de la habitual = parpadeo */
+  BLINK_RATIO: 0.55,
+  /** tras un parpadeo el iris tarda un instante en medirse bien */
+  BLINK_HOLD_MS: 90,
+  /** una muestra no vale por más de esto (si la cara llega a saltos) */
+  MAX_STEP_MS: 250,
+  /** ventana de "últimos segundos" para los avisos */
+  RECENT_MS: 5000,
+};
+
+export type GazeSummary = {
+  /** % del tiempo mirando a cámara */
+  onCameraPct: number;
+  /** hacia dónde se fue la mirada la mayor parte del tiempo que no estuvo en el lente */
+  tendency: GazeDirection | null;
+};
+
+/**
+ * Medidor de mirada: junta las muestras de cada cuadro y decide, sin temblar,
+ * si se percibe que miras a cámara.
+ *   · filtra el temblor del iris (One Euro);
+ *   · ignora los parpadeos: con el ojo cerrado el iris no se ve y la medida
+ *     salta; no cuentan ni a favor ni en contra;
+ *   · histéresis y permanencia: no cambia de estado por rozar el umbral;
+ *   · lleva la cuenta por TIEMPO (no por cuadros) de cuánto miraste a cámara y
+ *     hacia dónde se te fue la mirada cuando no.
+ * Puro: el reloj entra por parámetro.
+ */
+export class GazeMeter {
+  private readonly fh = new OneEuro();
+  private readonly fv = new OneEuro();
+  private on = false;
+  private pendingSince = -1;
+  private openRef = 0;
+  private blinkUntil = 0;
+  private lastT = -1;
+  private last: GazeReading | null = null;
+  // totales de la toma (ms)
+  private total = 0;
+  private onTime = 0;
+  private offDir: Record<GazeDirection, number> = { abajo: 0, arriba: 0, derecha: 0, izquierda: 0 };
+  // últimos segundos
+  private recent: { t: number; dt: number; on: boolean; dir: GazeDirection }[] = [];
+
+  /** La mirada filtrada más reciente (sin restar la calibración). */
+  filtered: Gaze | null = null;
+  /** La última muestra cayó en un parpadeo (la calibración tampoco debe usarla). */
+  blinking = false;
+
+  private isBlink(open: number, tMs: number): boolean {
+    // apertura habitual: sube rápido, baja muy despacio (mirar abajo entrecierra, no es parpadear)
+    this.openRef = open > this.openRef ? open : this.openRef + (open - this.openRef) * 0.002;
+    if (open < Math.max(0.1, this.openRef * GAZE_METER.BLINK_RATIO)) {
+      this.blinkUntil = tMs + GAZE_METER.BLINK_HOLD_MS;
+      return true;
+    }
+    return tMs < this.blinkUntil;
+  }
+
+  /**
+   * Una muestra nueva: mirada respecto al lente (`gazeToCamera`), apertura del
+   * ojo y la hora. Devuelve la lectura vigente (en un parpadeo, la anterior).
+   */
+  push(gaze: Gaze, open: number, tMs: number, cal: GazeCalibration | null): GazeReading | null {
+    this.blinking = this.isBlink(open, tMs);
+    if (this.blinking) {
+      this.lastT = tMs; // el tiempo del parpadeo no se le carga a nadie
+      return this.last;
+    }
+    const g = { h: this.fh.filter(gaze.h, tMs), v: this.fv.filter(gaze.v, tMs) };
+    this.filtered = g;
+    const r = readGaze(g, cal);
+    // histéresis + permanencia (la primera muestra fija el estado sin esperar)
+    const want = this.on ? r.dist <= GAZE_METER.EXIT : r.dist <= 1;
+    if (!this.last) this.on = r.dist <= 1;
+    else if (want === this.on) this.pendingSince = -1;
+    else if (this.pendingSince < 0) this.pendingSince = tMs;
+    else if (tMs - this.pendingSince >= GAZE_METER.DWELL_MS) {
+      this.on = want;
+      this.pendingSince = -1;
+    }
+    r.onCamera = this.on;
+    if (cal) {
+      const dt = this.lastT < 0 ? 0 : Math.min(GAZE_METER.MAX_STEP_MS, Math.max(0, tMs - this.lastT));
+      const dir = gazeDirection(r.dh, r.dv);
+      this.total += dt;
+      if (this.on) this.onTime += dt;
+      else this.offDir[dir] += dt;
+      this.recent.push({ t: tMs, dt, on: this.on, dir });
+      while (this.recent.length && tMs - this.recent[0].t > GAZE_METER.RECENT_MS) this.recent.shift();
+    }
+    this.lastT = tMs;
+    this.last = r;
+    return r;
+  }
+
+  /** Sin cara un rato: lo siguiente que llegue empieza de cero (sin arrastrar el filtro). */
+  lost(): void {
+    this.fh.reset();
+    this.fv.reset();
+    this.last = null;
+    this.filtered = null;
+    this.lastT = -1;
+    this.pendingSince = -1;
+  }
+
+  /** Empieza la cuenta de una toma nueva (o tras calibrar). */
+  resetStats(): void {
+    this.total = 0;
+    this.onTime = 0;
+    this.offDir = { abajo: 0, arriba: 0, derecha: 0, izquierda: 0 };
+    this.recent = [];
+  }
+
+  private static tendencyOf(dir: Record<GazeDirection, number>, off: number): GazeDirection | null {
+    if (off <= 0) return null;
+    let best: GazeDirection = "abajo";
+    for (const k of ["arriba", "derecha", "izquierda"] as const) if (dir[k] > dir[best]) best = k;
+    // solo si de verdad domina una dirección
+    return dir[best] >= off * 0.45 ? best : null;
+  }
+
+  /** Resumen de la toma. */
+  get summary(): GazeSummary {
+    const off = this.total - this.onTime;
+    return {
+      onCameraPct: this.total > 0 ? Math.round((this.onTime / this.total) * 100) : 0,
+      tendency: GazeMeter.tendencyOf(this.offDir, off),
+    };
+  }
+
+  /**
+   * Últimos segundos: fracción del tiempo fuera del lente (0–1) y hacia dónde.
+   * `offShare` es -1 si aún no hay datos suficientes.
+   */
+  get lately(): { offShare: number; tendency: GazeDirection | null } {
+    let total = 0;
+    let off = 0;
+    const dir: Record<GazeDirection, number> = { abajo: 0, arriba: 0, derecha: 0, izquierda: 0 };
+    for (const s of this.recent) {
+      total += s.dt;
+      if (!s.on) {
+        off += s.dt;
+        dir[s.dir] += s.dt;
+      }
+    }
+    if (total < GAZE_METER.RECENT_MS * 0.5) return { offShare: -1, tendency: null };
+    return { offShare: off / total, tendency: GazeMeter.tendencyOf(dir, off) };
+  }
 }
 
 // ----- corrección de mirada (beta) -----
@@ -178,7 +487,7 @@ export function eyeShift(e: EyeGeom, reading: GazeReading): Pt | null {
   const open = e.open / e.width;
   if (open < EYE_FIX.MIN_OPEN_RATIO) return null;
   const blink = smooth01((open - EYE_FIX.MIN_OPEN_RATIO) / (EYE_FIX.FULL_OPEN_RATIO - EYE_FIX.MIN_OPEN_RATIO));
-  const dist = Math.hypot(reading.dh / GAZE_OK.h, reading.dv / GAZE_OK.v);
+  const dist = gazeDistance(reading.dh, reading.dv);
   const gate = 1 - smooth01((dist - EYE_FIX.GATE_START) / (EYE_FIX.GATE_END - EYE_FIX.GATE_START));
   const k = blink * gate;
   if (k <= 0.01) return null;
@@ -205,12 +514,27 @@ export function eyeRoi(e: EyeGeom, w: number, h: number): { x: number; y: number
   return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
 }
 
+/** Hasta dónde llega (px) la zona que se mueve con el iris. */
+export function irisReach(e: EyeGeom): number {
+  return Math.max(e.irisR * 1.6, e.width * 0.22);
+}
+
+/** El mismo ojo, trasladado (dx, dy) píxeles: dónde estará un instante después. */
+export function movedEye(e: EyeGeom, dx: number, dy: number): EyeGeom {
+  if (!dx && !dy) return e;
+  const mv = (p: Pt): Pt => ({ x: p.x + dx, y: p.y + dy });
+  return { ...e, a: mv(e.a), b: mv(e.b), center: mv(e.center), iris: mv(e.iris) };
+}
+
 /**
  * Desplaza el iris dentro del ojo con un warp inverso suave: cada píxel toma
  * el color de `p - shift·peso(p)`, con peso 1 en el iris y 0 en los párpados
  * y fuera del ojo, así que la piel no se mueve y no quedan costuras.
  * `src` y `dst` son RGBA del mismo tamaño (la ROI); coordenadas de `e` ya
  * relativas a la ROI.
+ *
+ * Es la referencia (con tests) y el camino sin WebGL2; con WebGL2 el mismo
+ * warp corre en la GPU (eyeWarp en gl.ts): si cambias uno, cambia el otro.
  */
 export function warpEye(src: Uint8ClampedArray, dst: Uint8ClampedArray, w: number, h: number, e: EyeGeom, shift: Pt): void {
   dst.set(src);
@@ -218,7 +542,7 @@ export function warpEye(src: Uint8ClampedArray, dst: Uint8ClampedArray, w: numbe
   const sin = Math.sin(e.angle);
   const ax = e.width / 2;
   const ay = Math.max(1, e.open / 2);
-  const irisReach = Math.max(e.irisR * 1.6, e.width * 0.22);
+  const reach = irisReach(e);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const dx = x + 0.5 - e.center.x;
@@ -236,7 +560,7 @@ export function warpEye(src: Uint8ClampedArray, dst: Uint8ClampedArray, w: numbe
         // borde de los párpados, donde el peso es 0 y no hay costura.
         const edge = 1 - smooth01((ell - 0.78) / 0.22);
         const di = Math.hypot(x + 0.5 - e.iris.x - shift.x, y + 0.5 - e.iris.y - shift.y);
-        const core = 1 - smooth01((di - e.irisR * 1.15) / Math.max(1, irisReach - e.irisR * 1.15));
+        const core = 1 - smooth01((di - e.irisR * 1.15) / Math.max(1, reach - e.irisR * 1.15));
         wx = wy = edge * Math.max(0.3, core);
       } else {
         // Párpados: acompañan el movimiento vertical como en un ojo real

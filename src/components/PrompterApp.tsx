@@ -28,7 +28,8 @@ import { installOnDevice, onDeviceState, type OnDeviceState } from "@/lib/speech
 import { pickBiasPhrases } from "@/lib/speech/phrases";
 import { detectSupport, type Support } from "@/lib/speech/support";
 import { listCustomBackgrounds, type CustomBackground } from "@/lib/video/backgrounds";
-import { preloadVision } from "@/lib/video/compositor";
+import { preloadVision, type GazeDirection } from "@/lib/video/compositor";
+import { EDGE_TUNE } from "@/lib/video/gl";
 
 type Phase = "edit" | "ready" | "starting" | "recording" | "paused" | "finished";
 
@@ -77,7 +78,7 @@ export function PrompterApp() {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [customs, setCustoms] = useState<CustomBackground[]>([]);
   const [onDevice, setOnDevice] = useState<OnDeviceState>("unsupported");
-  const [lastGazePct, setLastGazePct] = useState<number | null>(null);
+  const [lastGaze, setLastGaze] = useState<{ pct: number; tendency: GazeDirection | null } | null>(null);
   const countdownCancelRef = useRef<(() => void) | null>(null);
   const silenceWarnedRef = useRef(false);
   const idleTimerRef = useRef<number | null>(null);
@@ -148,12 +149,16 @@ export function PrompterApp() {
   // Puente de depuración (solo dev): window.__vp.feed("texto", isFinal); lo usan las pruebas e2e
   useEffect(() => {
     if (process.env.NODE_ENV === "production") return;
-    (window as unknown as { __vp?: unknown }).__vp = { feed: alignFeed, reset: alignReset, nudge: alignNudge, store: alignStore, comp };
+    (window as unknown as { __vp?: unknown }).__vp = { feed: alignFeed, reset: alignReset, nudge: alignNudge, store: alignStore, comp, tune: EDGE_TUNE };
   }, [alignFeed, alignReset, alignNudge, alignStore, comp]);
 
   const speechSupported = !!support?.speech;
   const isLive = phase === "recording" || phase === "paused";
   useWakeLock(isLive || cameraActive);
+  // grabando, el regulador de rendimiento no prueba perfiles más pesados
+  useEffect(() => {
+    comp?.setLive(isLive);
+  }, [comp, isLive]);
   // el cursor se adelanta a tu ritmo mientras hablas (ver lib/align/predictor)
   useVoiceActivity(pipeline?.analyser ?? null, phase === "recording", alignTick);
 
@@ -301,7 +306,7 @@ export function PrompterApp() {
     if (!isLive) return;
     // la cámara se apaga al terminar: guardar antes cuánto miraste a cámara
     const g = comp?.gaze;
-    setLastGazePct(video && settings.fx.gazeMeter && g?.calibrated ? g.onCameraPct : null);
+    setLastGaze(video && settings.fx.gazeMeter && g?.calibrated ? { pct: g.onCameraPct, tendency: g.tendency } : null);
     speechStop();
     alignIdle();
     await recStop();
@@ -557,7 +562,8 @@ export function PrompterApp() {
                 recording={recorder.recording}
                 wordsRead={wordsRead}
                 wordsTotal={script.units.length}
-                gazePct={lastGazePct}
+                gazePct={lastGaze?.pct ?? null}
+                gazeTendency={lastGaze?.tendency ?? null}
                 format={settings.exportFormat}
                 onFormat={(f) => patchSettings({ exportFormat: f })}
                 videoFormat={settings.videoExportFormat}

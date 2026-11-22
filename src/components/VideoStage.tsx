@@ -6,7 +6,7 @@ import { IconCamera, IconChevronDown, IconRestart } from "./icons";
 import type { CameraStatus } from "@/hooks/useCamera";
 import { useCompositorTick } from "@/hooks/useCompositor";
 import type { CueGeometry } from "@/lib/persist";
-import type { GazeState, VideoCompositor } from "@/lib/video/compositor";
+import type { GazeDirection, GazeState, VideoCompositor } from "@/lib/video/compositor";
 
 type Props = {
   comp: VideoCompositor | null;
@@ -32,15 +32,36 @@ type Props = {
   children: ReactNode;
 };
 
-function GazePill({ gaze, live }: { gaze: GazeState; live?: boolean }) {
+/**
+ * Flecha hacia donde se va la mirada, tal como se ve en pantalla: la dirección
+ * viene en la imagen sin espejo, y con la vista previa en espejo los lados se
+ * invierten.
+ */
+function gazeArrow(dir: GazeDirection | null, mirror: boolean): string {
+  if (dir === "abajo") return "↓";
+  if (dir === "arriba") return "↑";
+  if (dir === "derecha") return mirror ? "←" : "→";
+  if (dir === "izquierda") return mirror ? "→" : "←";
+  return "";
+}
+
+function GazePill({ gaze, live, mirror }: { gaze: GazeState; live?: boolean; mirror: boolean }) {
   if (gaze.calibrating) return <span className="chip h-6 px-2 text-[0.66rem] text-amber-soft">Calibrando la mirada…</span>;
   if (!gaze.face) return <span className="chip h-6 px-2 text-[0.66rem]">No veo tu cara</span>;
+  if (gaze.calibrationFailed)
+    return (
+      <span className="chip h-6 px-2 text-[0.66rem] text-amber-soft" title="Mira fijo al lente, sin mover los ojos, mientras calibra">
+        No pude calibrar: mira fijo al lente
+      </span>
+    );
   if (!gaze.calibrated) return <span className="chip h-6 px-2 text-[0.66rem] text-amber-soft">Calibra la mirada</span>;
   const ok = gaze.reading?.onCamera;
+  const arrow = ok ? "" : gazeArrow(gaze.direction, mirror);
   return (
     <span className={`gaze-pill ${ok ? "ok" : "off"}`} title="Qué tanto parece que miras a cámara en esta toma" aria-live="off">
       <span className="gaze-dot" />
-      {live ? (ok ? "Mirando a cámara" : "Se nota que lees") : "Mirada a cámara"}
+      {live ? (ok ? "Mirando a cámara" : "Se nota que lees") : ok ? "Mirando a cámara" : "Mirada fuera del lente"}
+      {arrow && <span aria-hidden="true">{arrow}</span>}
       <b>{gaze.onCameraPct}%</b>
     </span>
   );
@@ -122,10 +143,10 @@ export function VideoStage(p: Props) {
                   </button>
                 </>
               )}
-              {p.showGaze && gaze && !p.live ? <GazePill gaze={gaze} /> : null}
+              {p.showGaze && gaze && !p.live ? <GazePill gaze={gaze} mirror={p.mirror} /> : null}
             </>
           }
-          hud={p.showGaze && gaze && p.live ? <GazePill gaze={gaze} live /> : null}
+          hud={p.showGaze && gaze && p.live ? <GazePill gaze={gaze} live mirror={p.mirror} /> : null}
         >
           {p.children}
         </CueCard>

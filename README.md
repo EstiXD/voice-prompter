@@ -56,33 +56,69 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   (máx. 2 palabras por delante, se para en silencio) y auto-scroll propio por
   cuadro en vez del `smooth` nativo.
 - **Cámara** (`src/lib/video`): `compositor.ts` orquesta cámara → recorte de
-  persona (MediaPipe Image Segmenter multiclase,
-  `public/models/selfie_multiclass_256x256.tflite`; el ligero
-  `selfie_segmenter_landscape.tflite` queda de respaldo) → `gl.ts` (WebGL2:
-  borde refinado guiado por la imagen, desenfoque sin halo, limpieza del
-  color del fondo real en el borde, light wrap y luz) → retoque y mirada en
-  Canvas 2D, en un canvas que es a la vez vista previa y fuente de
-  `captureStream`. Sin WebGL2 cae a un camino 100 % Canvas 2D. Los fondos
-  incluidos son escenas pintadas en canvas y desenfocadas como foto
-  (`backgrounds.ts`): sin imágenes externas ni licencias. Cara y mirada con MediaPipe Face
-  Landmarker (`public/models/face_landmarker.task`); la geometría y el warp
-  de ojos son puros y con tests (`face.ts`). El runtime wasm de MediaPipe se
-  copia a `public/mediapipe/` en `postinstall`. Si la máquina no llega, el
-  recorte se calcula cada 2–3 cuadros.
+  persona → `gl.ts` (WebGL2: borde refinado con filtro guiado por la imagen,
+  desenfoque sin halo, limpieza del color del fondo real en el borde, light
+  wrap y luz) → retoque y mirada en Canvas 2D, en un canvas que es a la vez
+  vista previa y fuente de `captureStream`. Sin WebGL2 cae a un camino 100 %
+  Canvas 2D. Los fondos incluidos son escenas pintadas en canvas y
+  desenfocadas como foto (`backgrounds.ts`): sin imágenes externas ni
+  licencias. Cara y mirada con MediaPipe Face Landmarker
+  (`public/models/face_landmarker.task`); la geometría y el warp de ojos son
+  puros y con tests (`face.ts`). El runtime wasm de MediaPipe se copia a
+  `public/mediapipe/` en `postinstall`.
+- **Rendimiento del modo cámara**: el hilo principal solo compone; MediaPipe
+  corre en workers (`src/workers/vision.worker.ts`, uno para el recorte y otro
+  para la cara) y nada espera a la GPU (la luz de la escena se mide con una
+  lectura asíncrona). Con fondo activo cada cuadro se compone un paso de
+  cámara más tarde, cuando ya llegó SU máscara: el borde va clavado aunque te
+  muevas. El regulador (`perf.ts`, con tests) mide cuadros y tiempos en cada
+  equipo y elige solo:
+  - modelo del recorte: `selfie_segmenter_landscape.tflite` (rápido, corre en
+    casi todo) o `selfie_multiclass_256x256.tflite` (borde más fino, ~5× más
+    caro; solo donde sobra gráfica);
+  - si el modelo rápido rinde más en la gráfica o en el procesador (se mide
+    un segundo con cada uno la primera vez);
+  - calidad de la composición (muestras del desenfoque, luz de borde, nitidez
+    y limpieza de ruido).
+
+  En equipos de gama media con núcleos libres, el modelo fino corre de vez en
+  cuando como "maestro": marca lo que el rápido confunde con persona (la
+  silla de detrás) y la GPU lo veta mientras se siga viendo igual. Lo
+  aprendido se guarda por aparato (`voice-prompter:perf:v1`). Para fijar un
+  perfil a mano: `localStorage.setItem("vp:perf", "multi,2")` (modelo
+  `lite`/`multi`, calidad `0`–`2`) y recargar. Sin workers u `OffscreenCanvas`
+  todo sigue en el hilo principal.
 - **Alineación** (`src/lib/align/aligner.ts`): alineación de secuencias con
   pesos (programación dinámica) de todo lo dicho contra una ventana del
   guion: las palabras funcionales ("y", "de") casi no pesan, saltarse
   palabras cuesta, y un salto solo gana con varias palabras que lo
   confirman; los saltos se avisan en pantalla con opción de volver.
-- **Mirada (beta)** (`src/lib/video/face.ts`): iris trasladado rígido dentro
-  del ojo, párpados que acompañan el movimiento vertical (≈62 % el superior,
-  25 % el inferior), y la corrección se desvanece al parpadear, al girar la
-  cabeza o al mirar lejos a propósito (umbrales inspirados en NVIDIA Maxine
-  e Intel ECC-Net).
-- **Recorte limpio**: persona = 1 − fondo − objetos lejos de la cabeza; se
-  quitan islas sueltas, se rellenan huecos pequeños cerrados, la cara queda
-  siempre sólida, y el suavizado temporal se adapta al movimiento. El
-  desenfoque es tipo lente (bokeh, espiral de ángulo áureo) sin halo.
+- **Medidor de mirada (beta)** (`src/lib/video/face.ts`, con tests): la
+  mirada respecto al lente es la posición del iris dentro del ojo MÁS hacia
+  dónde apunta la cabeza (matriz de pose de Face Landmarker) y dónde queda el
+  lente desde tu sitio. Sin eso, girar la cabeza 6° sin dejar de mirar al
+  lente ya marcaba "se nota que lees". Encima: filtro One Euro contra el
+  temblor del iris, parpadeos que no cuentan, histéresis para no parpadear
+  entre estados, tolerancia mayor hacia abajo que hacia arriba (así lo
+  percibe quien ve el video) y la cuenta por tiempo, no por cuadros. Dice
+  hacia dónde se va la mirada (flecha en la píldora, aviso si llevas varios
+  segundos fuera y consejo al terminar la toma). La calibración se descarta
+  si no miraste fijo, se recuerda entre sesiones (`voice-prompter:gaze:v1`) y
+  se refresca en cada cuenta 3-2-1.
+- **Corrección de mirada (beta)**: iris trasladado rígido dentro del ojo,
+  párpados que acompañan el movimiento vertical (≈62 % el superior, 25 % el
+  inferior); se desvanece al parpadear, al girar la cabeza, al mirar lejos a
+  propósito (umbrales inspirados en NVIDIA Maxine e Intel ECC-Net) y cuando
+  la cabeza se mueve rápido. Corre en la GPU, dentro del pase de composición
+  (`eyeWarp` en `gl.ts`); `warpEye` en `face.ts` es la referencia con tests
+  y el camino sin WebGL2. Como los puntos de la cara llegan un par de
+  cuadros después que la imagen, los ojos se llevan a donde estarán con la
+  velocidad de las dos últimas detecciones.
+- **Recorte limpio** (`mask.ts`, con tests): con el modelo fino, persona =
+  1 − fondo − objetos lejos de la cabeza; se quitan islas sueltas y se
+  rellenan huecos pequeños cerrados. La cara queda siempre sólida y el
+  suavizado temporal se adapta al movimiento. El desenfoque es tipo lente
+  (bokeh, espiral de ángulo áureo) y no toma color de tu contorno.
 - **Información en pantalla** (`StudioHud`): sección del guion, progreso y
   tiempo restante, ritmo en ppm, avisos de luz/encuadre/micrófono y guías
   de encuadre. Nada de eso sale en el video.
@@ -96,7 +132,7 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
 ```bash
 pnpm install      # copia también los worklets a public/worklets/
 pnpm dev          # http://localhost:3000
-pnpm test         # vitest (alineador, predictor, detector de voz, geometría de ojos)
+pnpm test         # vitest (alineador, predictor, detector de voz, ojos y mirada, recorte, regulador)
 pnpm e2e -- --audio voz.wav --script guion.txt --video cam.mjpeg   # ver abajo
 pnpm lint
 pnpm typecheck

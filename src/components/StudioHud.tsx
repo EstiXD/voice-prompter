@@ -94,6 +94,17 @@ export function StudioHud({ script, store, analyser, comp, live, session, mirror
           else if (f.size > 0.62) tips.push({ id: "size", text: "Aléjate un poco de la cámara", tone: "info" });
           if (f.cy > 0.6) tips.push({ id: "head", text: "Sube la cámara o baja la silla: tus ojos deben quedar en el tercio de arriba", tone: "info" });
         }
+        // mirada (grabando): solo si llevas varios segundos casi sin mirar al lente
+        const lately = comp.gaze.lately;
+        if (live && lately.offShare >= 0.6) {
+          const text =
+            lately.tendency === "abajo"
+              ? "Se nota que lees: sube la tarjeta hasta pegarla al lente"
+              : lately.tendency === "derecha" || lately.tendency === "izquierda"
+                ? "Se nota que lees: haz la tarjeta más angosta y céntrala bajo el lente"
+                : "Se nota que lees: vuelve al lente entre frase y frase";
+          tips.push({ id: "gaze", text, tone: "info" });
+        }
       }
       // micrófono (grabando)
       const lv = levelRef.current;

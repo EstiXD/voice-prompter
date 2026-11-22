@@ -24,6 +24,8 @@ const STYLES: { id: ColorStyle; label: string; swatch: string }[] = [
 ];
 import { useCompositorTick } from "@/hooks/useCompositor";
 
+const QUALITY_LABEL = ["ligera", "media", "alta"] as const;
+
 type Props = {
   open: boolean;
   onClose: () => void;
@@ -99,7 +101,7 @@ export function LookPanel(p: Props) {
   useCompositorTick(p.open ? p.comp : null);
   const status = p.comp?.status ?? null;
   const calibrated = !!p.comp?.gaze.calibrated;
-  const fps = p.comp ? p.comp.stats.fps : null;
+  const stats = p.comp ? p.comp.stats : null;
 
   useEffect(() => {
     if (!p.open) return;
@@ -306,7 +308,7 @@ export function LookPanel(p: Props) {
               checked={p.fx.gazeMeter}
               onChange={(v) => p.onFx({ ...p.fx, gazeMeter: v })}
               label="Medidor de mirada"
-              hint="Te dice si se nota que lees: verde = parece que miras a cámara."
+              hint="Te dice si se nota que lees: verde = parece que miras a cámara. Tiene en cuenta el giro de tu cabeza, no solo los ojos."
               icon={<IconEye className="h-4 w-4" />}
               beta
             />
@@ -327,11 +329,15 @@ export function LookPanel(p: Props) {
               {calibrated ? "Volver a calibrar la mirada" : "Calibrar la mirada"}
             </button>
             <p className="mt-2 text-xs leading-snug text-paper-mute">
-              Calibrar: mira fijo al lente de tu cámara durante 2 segundos. Repítelo si te mueves de sitio.
+              Calibrar: mira fijo al lente de tu cámara durante 2 segundos. Se recuerda para la próxima vez y se refresca sola en cada cuenta 3-2-1.
             </p>
           </section>
 
-          {fps !== null && <p className="mt-4 text-right font-mono text-[0.68rem] text-paper-mute">{fps} fps</p>}
+          {stats && (
+            <p className="mt-4 text-right font-mono text-[0.68rem] text-paper-mute" title="El modo cámara se ajusta solo a lo que aguanta este equipo">
+              {stats.fps} fps · recorte {stats.model === "multi" ? "fino" : "rápido"} · calidad {QUALITY_LABEL[stats.quality]}
+            </p>
+          )}
         </div>
       </aside>
     </>
