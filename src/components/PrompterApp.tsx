@@ -19,6 +19,7 @@ import { useCompositor } from "@/hooks/useCompositor";
 import { useMediaDevices } from "@/hooks/useMediaDevices";
 import { useMicPipeline } from "@/hooks/useMicPipeline";
 import { useRecorder } from "@/hooks/useRecorder";
+import { createDynamicsNode } from "@/lib/audio/dynamics";
 import { buildVoiceChain, VOICE_TUNE } from "@/lib/audio/voice";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 import { useVoiceActivity } from "@/hooks/useVoiceActivity";
@@ -153,7 +154,7 @@ export function PrompterApp() {
   // Puente de depuración (solo dev): window.__vp.feed("texto", isFinal); lo usan las pruebas e2e
   useEffect(() => {
     if (process.env.NODE_ENV === "production") return;
-    (window as unknown as { __vp?: unknown }).__vp = { feed: alignFeed, reset: alignReset, nudge: alignNudge, store: alignStore, comp, tune: EDGE_TUNE, voice: { build: buildVoiceChain, tune: VOICE_TUNE } };
+    (window as unknown as { __vp?: unknown }).__vp = { feed: alignFeed, reset: alignReset, nudge: alignNudge, store: alignStore, comp, tune: EDGE_TUNE, voice: { build: buildVoiceChain, tune: VOICE_TUNE, dynamics: createDynamicsNode } };
   }, [alignFeed, alignReset, alignNudge, alignStore, comp]);
 
   const speechSupported = !!support?.speech;
@@ -320,7 +321,7 @@ export function PrompterApp() {
     stoppingRef.current = true;
     // la cámara se apaga al terminar: guardar antes cuánto miraste a cámara
     const g = comp?.gaze;
-    setLastGaze(video && settings.fx.gazeMeter && g?.calibrated ? { pct: g.onCameraPct, tendency: g.tendency } : null);
+    setLastGaze(video && settings.fx.gazeMeter && g ? { pct: g.onCameraPct, tendency: g.tendency } : null);
     speechStop();
     alignIdle();
     await recStop();

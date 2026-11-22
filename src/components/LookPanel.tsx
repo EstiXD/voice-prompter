@@ -325,10 +325,7 @@ export function LookPanel(p: Props) {
               <Toggle
                 id="fx-eyes"
                 checked={p.fx.eyeContact}
-                onChange={(v) => {
-                  p.onFx({ ...p.fx, eyeContact: v, gazeMeter: v ? true : p.fx.gazeMeter });
-                  if (v && !calibrated) p.onCalibrate();
-                }}
+                onChange={(v) => p.onFx({ ...p.fx, eyeContact: v, gazeMeter: v ? true : p.fx.gazeMeter })}
                 label="Corrección de mirada"
                 hint="Lleva tus pupilas hacia el lente."
                 icon={<IconEye className="h-4 w-4" />}

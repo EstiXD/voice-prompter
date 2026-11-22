@@ -1,16 +1,17 @@
 // Cadena de audio del micrófono: captura → [RNNoise] → [cadena de voz: ecualización,
-// aire, compresor, limitador (ver voice.ts)] → destino (MediaRecorder /
-// reconocimiento) + analizador (VU).
+// aire y dinámica (ver voice.ts)] → destino (MediaRecorder / reconocimiento) +
+// analizador (VU).
 // Nunca se conecta a ctx.destination: no queremos oírnos (feedback).
 
 import type { RnnoiseWorkletNode } from "@sapphi-red/web-noise-suppressor";
 import { createRnnoiseNode } from "./rnnoise";
-import { buildVoiceChain, type VoiceChain } from "./voice";
+import { createDynamicsNode, loadGain, saveGain } from "./dynamics";
+import { buildVoiceChain, VOICE_TUNE, type VoiceChain } from "./voice";
 
 export type PipelineFlags = {
   /** supresión de ruido IA (RNNoise) */
   rnnoise: boolean;
-  /** cadena de voz: ecualización + aire + compresor + limitador */
+  /** cadena de voz: ecualización + aire + nivelador, compresor y limitador */
   enhance: boolean;
 };
 
@@ -37,16 +38,24 @@ export class MicPipeline {
   private rnnoiseNode: RnnoiseWorkletNode | null = null;
   private flags: PipelineFlags;
   private destroyed = false;
+  /** la última ganancia que avisó el nivelador (null = aún no te ha oído) */
+  private levelGainDb: number | null = null;
 
-  private constructor(ctx: AudioContext, rawStream: MediaStream, flags: PipelineFlags) {
+  private constructor(ctx: AudioContext, rawStream: MediaStream, flags: PipelineFlags, dynamics: AudioWorkletNode | null) {
     this.ctx = ctx;
     this.rawStream = rawStream;
     this.flags = { ...flags };
+    if (dynamics) {
+      // el nivelador va contando a qué ganancia llegó: la siguiente toma empieza ahí
+      dynamics.port.onmessage = (e: MessageEvent<{ gainDb?: number; heard?: boolean }>) => {
+        if (e.data?.heard && typeof e.data.gainDb === "number") this.levelGainDb = e.data.gainDb;
+      };
+    }
 
     this.source = ctx.createMediaStreamSource(rawStream);
 
     // la cadena de voz queda armada por dentro; rewire() solo decide qué entra y qué sale
-    this.chain = buildVoiceChain(ctx);
+    this.chain = buildVoiceChain(ctx, VOICE_TUNE, dynamics);
 
     this.dest = ctx.createMediaStreamDestination();
     // Voz = mono. Sin esto el stream sale estéreo (mono duplicado) y los
@@ -74,8 +83,14 @@ export class MicPipeline {
     const ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
     if (ctx.state !== "running") await ctx.resume();
 
-    const pipeline = new MicPipeline(ctx, rawStream, init);
     const track = rawStream.getAudioTracks()[0];
+    let dynamics: AudioWorkletNode | null = null;
+    try {
+      dynamics = await createDynamicsNode(ctx, loadGain(track?.label ?? ""));
+    } catch (err) {
+      console.warn("[pipeline] dinámica de voz no disponible, sigo con los compresores del navegador:", err);
+    }
+    const pipeline = new MicPipeline(ctx, rawStream, init, dynamics);
     if (track) {
       track.addEventListener("ended", () => events.onTrackEnded?.(), { once: true });
     }
@@ -161,6 +176,7 @@ export class MicPipeline {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.levelGainDb !== null) saveGain(this.deviceLabel, this.levelGainDb);
     this.disconnectAll();
     for (const n of this.chain.nodes) {
       try {

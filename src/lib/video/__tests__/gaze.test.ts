@@ -3,7 +3,9 @@ import {
   EYE_GAIN,
   GAZE_METER,
   GAZE_OK,
+  CALIB_LIMIT,
   GazeCalibrator,
+  plausibleCalibration,
   GazeMeter,
   OneEuro,
   gazeDirection,
@@ -101,6 +103,31 @@ describe("umbrales", () => {
     expect(gazeDirection(0.01, -0.06)).toBe("arriba");
     expect(gazeDirection(0.1, 0.01)).toBe("derecha");
     expect(gazeDirection(-0.1, 0.01)).toBe("izquierda");
+  });
+});
+
+describe("la calibración solo afina", () => {
+  const fixed = (h: number, v: number) => {
+    const c = new GazeCalibrator();
+    for (let i = 0; i < 20; i++) c.add({ h: h + (i % 2 ? 0.004 : -0.004), v });
+    return c.result();
+  };
+
+  it("mirando fijo cerca del lente, vale", () => {
+    const cal = fixed(-0.02, 0.03);
+    expect(cal).not.toBeNull();
+    expect(cal!.h).toBeCloseTo(-0.02, 2);
+  });
+
+  it("mirando fijo pero lejos del lente (los ojos aún en el botón de grabar), se descarta", () => {
+    expect(fixed(-0.092, 0.019)).toBeNull(); // la que dejó una toma entera en 0 % a cámara
+    expect(fixed(0.01, 0.1)).toBeNull();
+  });
+
+  it("plausibleCalibration marca el límite", () => {
+    expect(plausibleCalibration({ h: CALIB_LIMIT.h, v: -CALIB_LIMIT.v })).toBe(true);
+    expect(plausibleCalibration({ h: CALIB_LIMIT.h + 0.001, v: 0 })).toBe(false);
+    expect(plausibleCalibration({ h: 0, v: CALIB_LIMIT.v + 0.001 })).toBe(false);
   });
 });
 

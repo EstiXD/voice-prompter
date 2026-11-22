@@ -1,9 +1,12 @@
 // Cadena de voz: convierte la señal del micrófono (ya sin ruido) en una voz
-// lista para publicar. Solo usa nodos nativos de Web Audio, así corre igual en
-// el AudioContext en vivo y en uno "offline" (para medirla con una toma real).
+// lista para publicar. Corre igual en el AudioContext en vivo y en uno
+// "offline" (para medirla con una toma real).
 //
-//   voz ──── pasa-altos ─ ecualización ──┬─ compresor ─ nivel ─ limitador ─ techo ─ salida
+//   voz ──── pasa-altos ─ ecualización ──┬─ dinámica (nivelador, compresor, limitador) ─ salida
 //   micrófono ─ retardo ─ agudos ─ puerta ┘      (el "aire": solo con quita-ruido)
+//
+// La dinámica es un worklet propio (src/worklets/voice-dynamics.js). Si el
+// navegador no puede cargarlo, quedan los compresores nativos como respaldo.
 
 /**
  * Ajustes de la cadena. Salen de medir tomas reales con el micrófono de un
@@ -14,32 +17,30 @@ export const VOICE_TUNE = {
   /** pasa-altos: fuera el retumbe (ventilador, golpes en la mesa); la voz empieza más arriba */
   hpHz: 85,
   /**
-   * Ecualización correctiva. En las tomas sobraban 6–9 dB entre 200 y 315 Hz
-   * (la caja del portátil y el cuarto: voz "de cajón"), faltaban 5–8 dB entre
-   * 630 y 1250 Hz (voz hueca, lejana) y sobraban 4–11 dB entre 4 y 6,3 kHz
-   * (eses que chillan). Se corrige más o menos la mitad: cada micrófono y cada
-   * cuarto son distintos, y pasarse suena peor que quedarse corto.
+   * Ecualización correctiva. En las primeras tomas sobraban 6–9 dB entre 200
+   * y 315 Hz (la caja del portátil y el cuarto: voz "de cajón"), faltaban 5–8
+   * dB entre 630 y 1250 Hz (voz hueca, lejana) y sobraban 4–11 dB entre 4 y
+   * 6,3 kHz (eses que chillan). Se corrige más o menos la mitad: cada
+   * micrófono y cada cuarto son distintos, y pasarse suena peor que quedarse
+   * corto. Una toma de casi 7 minutos con esa primera corrección aún dejaba
+   * +6 dB en 160 Hz, de −4 a −6 dB entre 630 Hz y 2 kHz y de +4 a +6 dB entre
+   * 6 y 8 kHz: de ahí el estante de graves, el cuerpo más ancho y el estante
+   * de agudos.
    */
+  low: { hz: 170, db: -3 },
   mud: { hz: 240, q: 0.9, db: -5 },
-  body: { hz: 900, q: 0.7, db: 4 },
+  body: { hz: 1100, q: 0.5, db: 4.5 },
   harsh: { hz: 4500, q: 1.0, db: -4.5 },
+  top: { hz: 6500, db: -2 },
   /**
-   * Compresor: empareja frases fuertes y flojas sin aplastar. El nodo del
-   * navegador suma por su cuenta la ganancia que compensa su curva (unos 9 dB
-   * con estos valores), así que lo flojo sube: por eso el umbral no baja más.
+   * RESPALDO, solo si el worklet de dinámica no carga: compresores del
+   * navegador. No dan para más: con ellos, tres de cada cuatro tramos de voz
+   * salían con el pico clavado en el mismo valor (voz aplastada) y el volumen
+   * no pasaba de −17,5 LUFS por mucha ganancia que se pusiera. Van suaves.
    */
-  comp: { threshold: -24, knee: 12, ratio: 3, attack: 0.005, release: 0.25 },
-  /**
-   * Nivel tras el compresor (+15,6 dB): deja la voz sobre −16 LUFS, lo habitual
-   * en video. Ajustado midiendo tomas reales con esta misma cadena (EBU R128).
-   */
-  makeup: 6,
-  /**
-   * Limitador. El nodo del navegador no es un muro: con una voz fuerte dejaba
-   * pasar picos por encima de 0 dBFS (medido: +0,6). Por eso va más abajo y
-   * detrás lleva un techo.
-   */
-  limiter: { threshold: -6, knee: 0, ratio: 20, attack: 0.001, release: 0.1 },
+  comp: { threshold: -20, knee: 10, ratio: 2, attack: 0.008, release: 0.2 },
+  makeup: 2,
+  limiter: { threshold: -3, knee: 0, ratio: 20, attack: 0.001, release: 0.1 },
   /**
    * Techo: hasta "knee" (dBFS) no toca nada; de ahí en adelante redondea el
    * pico y nunca pasa de "max". Es lo que garantiza que la toma no sature.
@@ -170,21 +171,29 @@ function compressor(ctx: BaseAudioContext, c: { threshold: number; knee: number;
   return n;
 }
 
-export function buildVoiceChain(ctx: BaseAudioContext, tune: VoiceTune = VOICE_TUNE): VoiceChain {
+/**
+ * `dynamics`: el nodo del worklet de dinámica (ver dynamics.ts), ya creado para
+ * este contexto. Sin él se usan los compresores del navegador.
+ */
+export function buildVoiceChain(ctx: BaseAudioContext, tune: VoiceTune = VOICE_TUNE, dynamics?: AudioNode | null): VoiceChain {
   const input = ctx.createGain();
   const dryInput = ctx.createGain();
 
   // ----- voz: pasa-altos y ecualización -----
   const hp = biquad(ctx, "highpass", tune.hpHz, 0.707);
+  const low = biquad(ctx, "lowshelf", tune.low.hz, 1, tune.low.db);
   const mud = biquad(ctx, "peaking", tune.mud.hz, tune.mud.q, tune.mud.db);
   const body = biquad(ctx, "peaking", tune.body.hz, tune.body.q, tune.body.db);
   const harsh = biquad(ctx, "peaking", tune.harsh.hz, tune.harsh.q, tune.harsh.db);
+  const top = biquad(ctx, "highshelf", tune.top.hz, 1, tune.top.db);
   const sum = ctx.createGain();
   input.connect(hp);
-  hp.connect(mud);
+  hp.connect(low);
+  low.connect(mud);
   mud.connect(body);
   body.connect(harsh);
-  harsh.connect(sum);
+  harsh.connect(top);
+  top.connect(sum);
 
   // ----- aire: los agudos del micrófono, abiertos solo por la voz limpia -----
   const a = tune.air;
@@ -224,7 +233,15 @@ export function buildVoiceChain(ctx: BaseAudioContext, tune: VoiceTune = VOICE_T
   keyLp2.connect(keyGate);
   keyGate.connect(airGate.gain);
 
+  const nodes: AudioNode[] = [input, dryInput, hp, low, mud, body, harsh, top, sum, airDelay, airHp1, airHp2, airHp3, airGate, airLevel, keyBand, keyPre, keyAbs, keyLp1, keyLp2, keyGate];
+
   // ----- dinámica -----
+  if (dynamics) {
+    sum.connect(dynamics);
+    nodes.push(dynamics);
+    return { input, dryInput, output: dynamics, nodes };
+  }
+  // respaldo: compresores del navegador y un techo
   const comp = compressor(ctx, tune.comp);
   const makeup = ctx.createGain();
   makeup.gain.value = tune.makeup;
@@ -236,11 +253,7 @@ export function buildVoiceChain(ctx: BaseAudioContext, tune: VoiceTune = VOICE_T
   comp.connect(makeup);
   makeup.connect(limiter);
   limiter.connect(ceiling);
+  nodes.push(comp, makeup, limiter, ceiling);
 
-  return {
-    input,
-    dryInput,
-    output: ceiling,
-    nodes: [input, dryInput, hp, mud, body, harsh, sum, airDelay, airHp1, airHp2, airHp3, airGate, airLevel, keyBand, keyPre, keyAbs, keyLp1, keyLp2, keyGate, comp, makeup, limiter, ceiling],
-  };
+  return { input, dryInput, output: ceiling, nodes };
 }

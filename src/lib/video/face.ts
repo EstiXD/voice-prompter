@@ -195,6 +195,22 @@ export type GazeCalibration = { h: number; v: number; samples: number };
 /** dispersión máxima (desviación absoluta mediana, anchos de ojo) para dar por buena una calibración */
 const CALIB_MAX_SPREAD = 0.022;
 
+/**
+ * Hasta dónde puede apartarse una calibración del lente de verdad (anchos de
+ * ojo; 0,05 ≈ 7,5°). La mirada ya está medida RESPECTO AL LENTE (iris + giro y
+ * posición de la cabeza), así que mirar al lente da cerca de (0, 0) en
+ * cualquiera: la calibración solo afina lo que cambia de una persona a otra.
+ * Una que salga más lejos no es "tus ojos": es que no estabas mirando al
+ * lente (medido: calibrando justo tras hacer clic en grabar, con los ojos aún
+ * en el botón, salió −0,092; con esa referencia toda la toma marcó "0 % a
+ * cámara"). Esa se descarta.
+ */
+export const CALIB_LIMIT = { h: 0.05, v: 0.07 };
+
+export function plausibleCalibration(c: { h: number; v: number }): boolean {
+  return Math.abs(c.h) <= CALIB_LIMIT.h && Math.abs(c.v) <= CALIB_LIMIT.v;
+}
+
 const median = (a: number[]) => {
   const s = [...a].sort((x, y) => x - y);
   return s[Math.floor(s.length / 2)];
@@ -212,8 +228,9 @@ export class GazeCalibrator {
   }
   /**
    * Mediana (robusta a un parpadeo suelto). Devuelve null si hubo pocas
-   * muestras o si la mirada anduvo de un lado a otro: calibrar con eso fija
-   * como "mirar al lente" un punto que no lo es, y es peor que no calibrar.
+   * muestras, si la mirada anduvo de un lado a otro o si estaba fija pero
+   * lejos del lente (ver CALIB_LIMIT): calibrar con eso fija como "mirar al
+   * lente" un punto que no lo es, y es peor que no calibrar.
    */
   result(): GazeCalibration | null {
     if (this.hs.length < 8) return null;
@@ -222,6 +239,7 @@ export class GazeCalibrator {
     const spreadH = median(this.hs.map((x) => Math.abs(x - h)));
     const spreadV = median(this.vs.map((x) => Math.abs(x - v)));
     if (spreadH > CALIB_MAX_SPREAD || spreadV > CALIB_MAX_SPREAD) return null;
+    if (!plausibleCalibration({ h, v })) return null;
     return { h, v, samples: this.hs.length };
   }
 }

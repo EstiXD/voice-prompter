@@ -1,5 +1,6 @@
-// Copia el worklet y los binarios wasm de RNNoise a public/worklets/ para que
-// el navegador los cargue desde el mismo origen (AudioWorklet lo exige), y el
+// Copia el worklet y los binarios wasm de RNNoise y el worklet propio de la
+// dinámica de la voz a public/worklets/ para que el navegador los cargue desde
+// el mismo origen (AudioWorklet lo exige), y el
 // runtime wasm de MediaPipe (cámara: fondo y mirada) a public/mediapipe/.
 // Corre en postinstall; ambas carpetas están en .gitignore.
 import { createRequire } from "node:module";
@@ -12,6 +13,8 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // tasks-vision no exporta su carpeta wasm/ en "exports": se lee del paquete instalado.
 function resolveFile(spec) {
+  // "./…": un archivo de este mismo repo (worklets propios)
+  if (spec.startsWith("./")) return join(root, spec);
   try {
     return require.resolve(spec);
   } catch {
@@ -26,6 +29,8 @@ const GROUPS = [
       ["@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js", "rnnoiseWorklet.js"],
       ["@sapphi-red/web-noise-suppressor/rnnoise.wasm", "rnnoise.wasm"],
       ["@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm", "rnnoise_simd.wasm"],
+      // el nuestro: nivelador y limitador de la voz. Tras editarlo, volver a correr este script.
+      ["./src/worklets/voice-dynamics.js", "voice-dynamics.js"],
     ],
   },
   {

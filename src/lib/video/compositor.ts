@@ -32,6 +32,7 @@ import {
   gazeOf,
   gazeToCamera,
   GazeCalibrator,
+  plausibleCalibration,
   GazeMeter,
   headPose,
   headTurnFade,
@@ -356,19 +357,23 @@ function savePerfMemory(m: PerfMemory) {
 // ----- calibración de la mirada: se recuerda entre sesiones -----
 
 const GAZE_KEY = "voice-prompter:gaze:v1";
+/** de una calibración solo cuenta este tramo final, ms */
+const CALIB_TAIL_MS = 1300;
 const GAZE_TTL_MS = 30 * 24 * 3600 * 1000;
 
 /**
- * Como la mirada ya descuenta el giro y la posición de la cabeza, la
- * referencia de "mirar al lente" depende casi solo de tus ojos y de esta
- * cámara: vale de un día para otro. Así el medidor funciona nada más abrir, y
- * cada cuenta 3-2-1 la refresca.
+ * Como la mirada ya descuenta el giro y la posición de la cabeza, mirar al
+ * lente da cerca de (0, 0) sin calibrar: el medidor y la corrección funcionan
+ * nada más abrir. La calibración solo afina lo tuyo y de esta cámara: vale de
+ * un día para otro y cada cuenta atrás la refresca. Una guardada que quede
+ * lejos del lente (de antes de poner el límite) se descarta.
  */
 function loadGazeCalibration(): GazeCalibration | null {
   try {
     const o = JSON.parse(window.localStorage.getItem(GAZE_KEY) ?? "null") as { h?: unknown; v?: unknown; samples?: unknown; at?: unknown } | null;
     if (!o || typeof o.h !== "number" || typeof o.v !== "number" || typeof o.at !== "number") return null;
     if (!Number.isFinite(o.h) || !Number.isFinite(o.v) || Date.now() - o.at > GAZE_TTL_MS) return null;
+    if (!plausibleCalibration({ h: o.h, v: o.v })) return null;
     return { h: o.h, v: o.v, samples: typeof o.samples === "number" ? o.samples : 0 };
   } catch {
     return null;
@@ -520,6 +525,7 @@ export class VideoCompositor {
   private calibration: GazeCalibration | null = loadGazeCalibration();
   private calibrator: GazeCalibrator | null = null;
   private calibrateUntil = 0;
+  private calibrateFrom = 0;
   private calibFailedAt = 0;
   private reading: GazeReading | null = null;
   /** ya llegó alguna pose de cabeza: desde entonces una muestra sin pose no se mezcla con las demás */
@@ -734,11 +740,17 @@ export class VideoCompositor {
     if (fx.light || fx.beauty || fx.eyeContact || fx.gazeMeter || fx.studioLight) this.ensureFace();
   }
 
-  /** Mira a la cámara ~1,5 s: fija tu "mirada a cámara" de referencia. */
+  /**
+   * Mira a la cámara: afina tu "mirada a cámara" de referencia. De los `ms`
+   * solo cuenta el tramo final (CALIB_TAIL_MS): al principio los ojos aún
+   * vienen del botón que acabas de pulsar.
+   */
   calibrate(ms = 1500): void {
     this.ensureFace();
     this.calibrator = new GazeCalibrator();
-    this.calibrateUntil = performance.now() + ms;
+    const now = performance.now();
+    this.calibrateFrom = now + Math.max(0, ms - CALIB_TAIL_MS);
+    this.calibrateUntil = now + ms;
     this.calibFailedAt = 0;
     this.notify();
   }
@@ -1389,7 +1401,7 @@ export class VideoCompositor {
     const gaze = gazeToCamera(g.gaze, pose);
     this.reading = this.meter.push(gaze, g.open, now, this.calibration);
     if (this.calibrator) {
-      if (!this.meter.blinking) this.calibrator.add(gaze);
+      if (now >= this.calibrateFrom && !this.meter.blinking) this.calibrator.add(gaze);
       if (now >= this.calibrateUntil) {
         const cal = this.calibrator.result();
         this.calibrator = null;
@@ -1676,7 +1688,8 @@ export class VideoCompositor {
     this.eyeAt = now;
     const h = this.eyeHist;
     const b = h[h.length - 1];
-    const active = this.fx.eyeContact && !!this.calibration && !!this.reading && !this.calibrator && !!b && frameId - b.id <= 6;
+    // sin calibración también: la referencia es el lente mismo (ver loadGazeCalibration)
+    const active = this.fx.eyeContact && !!this.reading && !this.calibrator && !!b && frameId - b.id <= 6;
     const a = h.length > 1 ? h[0] : null;
     const span = a && b ? b.id - a.id : 0;
     const lead = b ? Math.max(-1, Math.min(3, frameId - b.id)) : 0;

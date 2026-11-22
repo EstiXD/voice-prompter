@@ -55,7 +55,6 @@ function GazePill({ gaze, live, mirror }: { gaze: GazeState; live?: boolean; mir
         No pude calibrar: mira fijo al lente
       </span>
     );
-  if (!gaze.calibrated) return <span className="chip h-6 px-2 text-[0.66rem] text-amber-soft">Calibra la mirada</span>;
   const ok = gaze.reading?.onCamera;
   const arrow = ok ? "" : gazeArrow(gaze.direction, mirror);
   return (

@@ -30,9 +30,9 @@ cursor; lo demás se muestra como estructura y el reconocedor lo ignora.
 ## Cómo funciona
 
 ```
-micrófono → [RNNoise wasm] → cadena de voz (ecualización, aire, compresor, limitador, techo) ─┬─ MediaRecorder (WebM/Opus) → conversión en el navegador
-                                                                                              │     (mediabunny + WebCodecs/WASM) → wav · mp3 · mp4 · flac · ogg
-                                                                                              └─ Web Speech API (Chrome 139+ recibe el audio ya limpio)
+micrófono → [RNNoise wasm] → cadena de voz (ecualización, aire, nivelador, compresor, limitador) ─┬─ MediaRecorder (WebM/Opus) → conversión en el navegador
+                                                                                                  │     (mediabunny + WebCodecs/WASM) → wav · mp3 · mp4 · flac · ogg
+                                                                                                  └─ Web Speech API (Chrome 139+ recibe el audio ya limpio)
 Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → alineador difuso (src/lib/align) → palabra actual + auto-scroll
 ```
 
@@ -49,20 +49,29 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   `@sapphi-red/web-noise-suppressor` (worklet + wasm copiados a
   `public/worklets/` en `postinstall`). Si RNNoise no carga, se degrada a la
   supresión nativa del navegador.
-- **Cadena de voz** (`src/lib/audio/voice.ts`, con tests): solo nodos nativos
-  de Web Audio, así corre igual en vivo y en un `OfflineAudioContext` (se
-  ajustó pasando tomas reales por ella y midiendo con EBU R128). Midiendo
-  tomas de un micrófono de portátil contra el espectro medio de la voz
-  hablada: sobraban 6–9 dB entre 200 y 315 Hz, faltaban 5–8 dB entre 630 y
-  1250 Hz y sobraban 4–11 dB entre 4 y 6,3 kHz; la ecualización corrige más
-  o menos la mitad. **Aire**: con una voz real RNNoise no deja nada por
-  encima de 8 kHz (voz "de teléfono"); esos agudos se toman del micrófono sin
-  limpiar, retrasados lo que tarda RNNoise (991 muestras), y una puerta los
-  abre solo en eses y consonantes (abrirla en las vocales dejaba más siseo
-  que voz). Después, compresor, nivel para quedar sobre −16 LUFS, limitador
-  y un **techo** que redondea los picos a −1 dBFS: el limitador del
-  navegador solo dejaba pasar picos por encima de 0 dBFS. Ojo: en Web Audio
-  la Q de pasa-altos y pasa-bajos va en decibelios.
+- **Cadena de voz** (`src/lib/audio/voice.ts`, con tests). Midiendo tomas de
+  un micrófono de portátil contra el espectro medio de la voz hablada:
+  sobraban 6–9 dB entre 200 y 315 Hz, faltaban 5–8 dB entre 630 y 1250 Hz y
+  sobraban 4–11 dB entre 4 y 6,3 kHz; la ecualización corrige más o menos la
+  mitad. **Aire**: con una voz real RNNoise no deja nada por encima de 8 kHz
+  (voz "de teléfono"); esos agudos se toman del micrófono sin limpiar,
+  retrasados lo que tarda RNNoise (991 muestras), y una puerta los abre solo
+  en eses y consonantes (abrirla en las vocales dejaba más siseo que voz).
+  Ojo: en Web Audio la Q de pasa-altos y pasa-bajos va en decibelios.
+- **Dinámica de la voz** (`src/worklets/voice-dynamics.js`, un AudioWorklet
+  propio; el mismo archivo se importa en los tests): nivelador lento →
+  compresor suave → limitador con 3 ms de anticipación. El nivelador mide tu
+  voz (no los silencios ni las respiraciones) y lleva la toma a unos −16 LUFS
+  hables flojo o fuerte y con cualquier micrófono; en silencio no mueve la
+  ganancia (no "respira" el ruido), y recuerda por micrófono dónde quedó para
+  que la primera palabra de la siguiente toma ya salga a su nivel. Sustituye
+  a los `DynamicsCompressorNode` del navegador: con ellos, tres de cada cuatro
+  tramos de voz salían con el pico clavado en el mismo valor (voz aplastada)
+  y el volumen no pasaba de −17,5 LUFS por mucha ganancia que se pusiera,
+  porque el limitador se la comía. Quedan solo de respaldo si el worklet no
+  carga. El worklet se copia a `public/worklets/` con
+  `node scripts/copy-worklets.mjs` (postinstall): **hay que volver a correrlo
+  tras editarlo**.
 - **Temporizador** (`src/lib/timer.ts`, con tests; botón del reloj en el
   dock): cuenta antes de grabar de 3, 5 o 10 s (en las largas, los primeros
   segundos son para acomodarse y la mirada se calibra en los últimos 3) y
@@ -168,9 +177,14 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   entre estados, tolerancia mayor hacia abajo que hacia arriba (así lo
   percibe quien ve el video) y la cuenta por tiempo, no por cuadros. Dice
   hacia dónde se va la mirada (flecha en la píldora, aviso si llevas varios
-  segundos fuera y consejo al terminar la toma). La calibración se descarta
-  si no miraste fijo, se recuerda entre sesiones (`voice-prompter:gaze:v1`) y
-  se refresca en cada cuenta 3-2-1.
+  segundos fuera y consejo al terminar la toma). Como la mirada ya está
+  medida respecto al lente, funciona sin calibrar; la calibración solo afina
+  lo que cambia de una persona a otra. Se toma del último tramo de la cuenta
+  atrás (al principio los ojos aún vienen del botón de grabar), se descarta
+  si no miraste fijo o si queda lejos del lente (más de 0,05 en horizontal o
+  0,07 en vertical: una tomada con los ojos en el botón salió −0,092 y dejó
+  una toma entera en "0 % a cámara"), y se recuerda entre sesiones
+  (`voice-prompter:gaze:v1`).
 - **Corrección de mirada**: iris trasladado rígido dentro del ojo,
   párpados que acompañan el movimiento vertical (≈62 % el superior, 25 % el
   inferior); se desvanece al parpadear, al girar la cabeza, al mirar lejos a
