@@ -21,7 +21,7 @@
 import type { FaceLandmarker, FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
 import { blurPx, imageBlurPx, paintPreset, prepareBackground, type BackgroundChoice } from "./backgrounds";
 import { GlRenderer, PROBE_H, PROBE_W, type ColorStyle, type EyeWarp } from "./gl";
-import { MaskCleaner, maskDrift, ObjectTracker, solidEllipse, toBytes, vetoMap } from "./mask";
+import { MaskCleaner, maskDrift, ObjectTracker, openBesideHead, solidEllipse, toBytes, vetoMap } from "./mask";
 import { PerfGovernor, pickDelegate, sanitizeMemory, type PerfMemory, type PerfProfile, type Quality, type SegDelegate, type SegModel } from "./perf";
 import { VisionLink, type FaceResult, type MaskResult } from "./vision-link";
 import {
@@ -468,6 +468,7 @@ export class VideoCompositor {
   private hairTone: number[] | null = null;
   private vetoBuf: Uint8Array | null = null;
   private vetoTmp: Uint8Array | null = null;
+  private looseBuf: Uint8Array | null = null;
   /** midiendo si a este equipo le rinde más recortar en GPU o en CPU */
   private calib: { stage: SegDelegate; masks: number; gpuMs: number } | null = null;
   private gl: GlRenderer | null = null;
@@ -1199,8 +1200,10 @@ export class VideoCompositor {
       this.vetoBuf = new Uint8Array(n);
       this.vetoTmp = new Uint8Array(n);
     }
+    // junto a tu cabeza el modelo fino toma el respaldo por pelo: ahí no se le cree (ver openBesideHead)
+    const loose = this.besideHead(fine.data, fine.w, fine.h);
     // lo que el modelo rápido reclama y el fino no: trozos de silla (y, alrededor de una mano, pared)
-    vetoMap(fast, fine.data, fine.w, fine.h, this.vetoBuf, this.vetoTmp!, 1);
+    vetoMap(fast, loose, fine.w, fine.h, this.vetoBuf, this.vetoTmp!, 1);
     // de ahí, lo que se repite sin parecerse al fondo de al lado ni a ti es la silla (ver ObjectTracker)
     if (fine.tones?.hair) this.hairTone = fine.tones.hair;
     // Si se está buscando tu cara y no aparece, no hay nadie: los "colores
@@ -1208,11 +1211,22 @@ export class VideoCompositor {
     // confunde con ropa) y protegerían justo lo que hay que reconocer.
     const nobody = this.faceLink?.state === "ready" && performance.now() - this.lastFaceAt > 1500;
     const you = nobody ? [] : [fine.tones?.skin, fine.tones?.clothes];
-    this.objects.update(this.vetoBuf, fine.data, fine.pixels, vw, vh, fine.w, you);
+    this.objects.update(this.vetoBuf, loose, fine.pixels, vw, vh, fine.w, you);
     this.gl.setYou(you[0], you[1]);
     this.gl.setChair(this.objects.chairColors());
     // al borrar la silla, su zona se ensancha: se lleva el canto y le da margen para mecerse contigo
-    this.gl.setTeach(this.objects.texture(fine.pixels, this.fx.keepChair ? 0 : 5, fine.data, fine.w), vw, vh);
+    this.gl.setTeach(this.objects.texture(fine.pixels, this.fx.keepChair ? 0 : 5, loose, fine.w, fine.data), vw, vh);
+  }
+
+  /** La máscara del modelo fino con la zona de al lado de tu cabeza abierta; la misma si no se ve tu cara. */
+  private besideHead(person: Uint8Array, w: number, h: number): Uint8Array {
+    const box = this.landmarks && performance.now() - this.lastFaceAt <= 600 ? this.faceBox() : null;
+    if (!box) return person;
+    if (this.looseBuf?.length !== person.length) this.looseBuf = new Uint8Array(person.length);
+    const sx = w / this.W;
+    const sy = h / this.H;
+    // el mismo óvalo que protege tu cabeza al borrar (ver tellHead)
+    return openBesideHead(person, w, h, (box.x + box.w / 2) * sx, (box.y + box.h * 0.3) * sy, box.w * 0.66 * sx, box.h * 0.72 * sy, (box.y + box.h) * sy, this.looseBuf);
   }
 
   /** Pasa a la GPU (o al camino 2D) la máscara que llegó del worker, si hay una nueva. */

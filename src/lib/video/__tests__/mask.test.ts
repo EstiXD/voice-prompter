@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classTone, MaskCleaner, maskDrift, OBJECT, ObjectTracker, sameColor, solidEllipse, toBytes, vetoMap } from "../mask";
+import { classTone, MaskCleaner, maskDrift, OBJECT, ObjectTracker, openBesideHead, sameColor, solidEllipse, toBytes, vetoMap } from "../mask";
 
 const W = 64;
 const H = 48;
@@ -358,6 +358,57 @@ describe("ObjectTracker", () => {
     t.update(chairSeed, person, chairPx, VW, VH, W);
     const o = t.update(chairSeed, person, dim, VW, VH, W);
     expect(at(o, 24, 15, VW)).toBe(255);
+  });
+
+  describe("junto a la cabeza no se le cree al modelo fino", () => {
+    it("openBesideHead abre lo que queda fuera del óvalo y por encima de la barbilla, y nada más", () => {
+      const fine = u8([[0, 0, W, H, 255]]); // el modelo fino lo ve todo como persona
+      const out = openBesideHead(fine, W, H, 32, 16, 8, 10, 30, new Uint8Array(W * H));
+      expect(at(out, 32, 16)).toBe(255); // dentro del óvalo: tu cabeza
+      expect(at(out, 32, 8)).toBe(255);
+      expect(at(out, 46, 16)).toBe(0); // al lado, a la altura de la oreja
+      expect(at(out, 32, 2)).toBe(0); // encima
+      expect(at(out, 46, 34)).toBe(255); // por debajo de la barbilla: hombros, no se toca
+      expect(at(fine, 46, 16)).toBe(255); // la original queda intacta
+    });
+
+    it("lo recordado donde el modelo fino dice que eres tú sale blando; lo demás, firme", () => {
+      const t = new ObjectTracker();
+      // el ala del respaldo: el modelo fino la toma por persona, pero con la zona abierta se reconoce
+      const fineAll = u8([
+        [16, 8, 40, 46, 255],
+        [44, 20, 56, 40, 255], // el ala, según el modelo fino: "persona"
+      ]);
+      const loose = person; // la misma sin el ala
+      t.update(chairSeed, loose, chairPx, VW, VH, W);
+      t.update(chairSeed, loose, chairPx, VW, VH, W);
+      const tex = t.texture(chairPx, 2, loose, W, fineAll);
+      const alpha = (x: number, y: number) => tex[(y * VW + x) * 4 + 3];
+      expect(alpha(24, 15)).toBe(OBJECT.SOFT); // ala recordada, donde el fino decía persona
+      expect(alpha(24, 9)).toBe(255); // pared de encima (canto ensanchado): no era persona para nadie
+      expect(alpha(24, 12)).toBe(OBJECT.SOFT);
+    });
+
+    it("la mancha entera y el canto no entran en lo que el modelo fino ve como persona", () => {
+      const t = new ObjectTracker();
+      const SHIRT_BLUE = [60, 90, 170];
+      // silla y, pegada, una manga tuya; el rápido lo reclama todo y la zona abierta deja ambas como "no persona"
+      const px = frame([
+        [22, 10, 28, 20, CHAIR],
+        [28, 10, 31, 20, SHIRT_BLUE],
+      ]);
+      const seed = half([[22, 10, 31, 20, 255]]);
+      const fineAll = u8([
+        [16, 8, 40, 46, 255],
+        [56, 20, 62, 40, 255], // la manga: el modelo fino sí la ve como tuya
+      ]);
+      t.update(seed, person, px, VW, VH, W, [null, SHIRT_BLUE]);
+      t.update(seed, person, px, VW, VH, W, [null, SHIRT_BLUE]);
+      const tex = t.texture(px, 2, person, W, fineAll);
+      const alpha = (x: number, y: number) => tex[(y * VW + x) * 4 + 3];
+      expect(alpha(24, 15)).toBe(255); // la silla
+      expect(alpha(29, 15)).toBe(0); // la manga: ni recordada (tiene tu color) ni alcanzada (es persona)
+    });
   });
 
   describe("chairColors", () => {

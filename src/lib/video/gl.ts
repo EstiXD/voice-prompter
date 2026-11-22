@@ -138,7 +138,8 @@ void main() {
   if (uVetoOn > 0.0) {
     // entero mientras el recuerdo sea firme; al aflojarse (lleva muchas
     // pasadas sin que nadie lo reclame) se va de una vez, no a medias
-    float obj = smoothstep(0.25, 0.4, texture(uVeto, vUv).a) * uVetoOn;
+    float firm = texture(uVeto, vUv).a;
+    float obj = smoothstep(0.25, 0.4, firm) * uVetoOn;
     if (obj > 0.02) {
       // ¿se ve como la silla que había en este punto?
       float same = sameAsRef(c, vUv);
@@ -168,7 +169,16 @@ void main() {
           float hairLike = uHair.a > 0.5 ? 1.0 - smoothstep(0.12, 0.26, length(c - uHair.rgb)) : 1.0;
           you = mix(you, 1.0 - same * (1.0 - hairLike), inHead);
         }
-        p = min(p, 1.0 - obj * (1.0 - you));
+        float gone = obj * (1.0 - you);
+        // Recuerdo "blando" (a ≈ 0,63): ahí el modelo fino dice que eres tú. Es
+        // la zona de al lado de tu cabeza, donde toma por pelo el ala de un
+        // respaldo. Solo se va lo que tiene un color de la silla y se le
+        // parece más que a tu pelo, tu piel o tu ropa: unos audífonos o un
+        // gorro de otro color se quedan.
+        float soft = 1.0 - smoothstep(0.7, 0.85, firm);
+        float chairHit = (1.0 - smoothstep(0.06, 0.12, gapChair)) * smoothstep(0.0, 0.03, min(gapYou, colorGap(c, uHair)) - gapChair);
+        gone *= mix(1.0, chairHit, soft);
+        p = min(p, 1.0 - gone);
       }
     }
   }

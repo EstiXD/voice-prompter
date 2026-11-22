@@ -377,7 +377,32 @@ export const OBJECT = {
   YOU_BRIGHTER: 1.8,
   /** hacen falta al menos estos puntos de una clase para fiarse de su color medio */
   YOU_POINTS: 24,
+  /** firmeza con la que sale lo recordado donde el modelo fino dice que eres tú (ver ObjectTracker.texture) */
+  SOFT: 160,
 };
+
+/**
+ * Copia de la máscara del modelo fino con la zona de AL LADO Y ENCIMA DE TU
+ * CABEZA abierta: por encima de la línea de la barbilla y fuera del óvalo de
+ * la cabeza, nada cuenta como persona. Ahí el modelo fino se equivoca justo
+ * con lo que hay que reconocer: toma por pelo el ala de un respaldo pegada a
+ * la cabeza. Lo que de verdad seas tú en esa zona (una mano levantada, una
+ * manga) no se pierde: tiene tu color y no se admite como objeto.
+ *
+ * `cx, cy, rx, ry` y `chinY`, en píxeles de la máscara (w×h).
+ */
+export function openBesideHead(person: Uint8Array, w: number, h: number, cx: number, cy: number, rx: number, ry: number, chinY: number, out: Uint8Array): Uint8Array {
+  out.set(person);
+  const y1 = Math.min(h, Math.max(0, Math.round(chinY)));
+  for (let y = 0; y < y1; y++) {
+    const dy = (y - cy) / Math.max(1, ry);
+    for (let x = 0; x < w; x++) {
+      const dx = (x - cx) / Math.max(1, rx);
+      if (dx * dx + dy * dy > 1) out[y * w + x] = 0;
+    }
+  }
+  return out;
+}
 
 /** Un color de referencia tuyo (piel, ropa): RGB medio, o null si no se pudo medir. */
 export type Tone = readonly number[] | null | undefined;
@@ -751,8 +776,14 @@ export class ObjectTracker {
    * Ninguna de las dos entra donde el modelo fino te ve (`fine`, ancho `w`).
    * Lo alcanzado lleva el color que tiene ahora. Para CONSERVAR no se hace
    * nada de esto: dejaría un cerco de pared alrededor de la silla.
+   *
+   * `person`: la máscara del modelo fino TAL CUAL, cuando `fine` es la copia
+   * con la zona junto a la cabeza abierta (ver `openBesideHead`). Lo recordado
+   * ahí donde el modelo fino dice que eres tú sale "blando" (a = 160 en vez
+   * de 255): quien borre solo se lo lleva si además tiene un color de la
+   * silla. Y ni la mancha entera ni el canto entran en lo que es `person`.
    */
-  texture(rgba: Uint8Array, spread = 0, fine?: Uint8Array, w = 0): Uint8Array {
+  texture(rgba: Uint8Array, spread = 0, fine?: Uint8Array, w = 0, person?: Uint8Array): Uint8Array {
     const acc = this.acc;
     const col = this.col;
     if (!acc || !col) return new Uint8Array(0);
@@ -772,9 +803,14 @@ export class ObjectTracker {
       }
       out[i * 4 + 3] = a;
     }
+    if (person && w > 0) {
+      const vw = w >> 1;
+      for (let i = 0; i < n; i++) if (out[i * 4 + 3] > 102 && person[((i / vw) | 0) * 2 * w + (i % vw) * 2] >= 128) out[i * 4 + 3] = OBJECT.SOFT;
+    }
     if (spread > 0 && fine && w > 0) {
       const vw = w >> 1;
       const vh = Math.floor(n / vw);
+      const you = person ?? fine;
       // 1) la mancha entera, a través de las semillas
       const seed = this.lastSeed;
       const queue = this.queue!;
@@ -791,7 +827,7 @@ export class ObjectTracker {
             const ny = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
             if (nx < 0 || nx >= vw || ny < 0 || ny >= vh) continue;
             const j = ny * vw + nx;
-            if (out[j * 4 + 3] > 102 || seed[j] <= 127 || fine[ny * 2 * w + nx * 2] >= 128 || this.likeTone(j, rgba, skin)) continue;
+            if (out[j * 4 + 3] > 102 || seed[j] <= 127 || you[ny * 2 * w + nx * 2] >= 128 || this.likeTone(j, rgba, skin)) continue;
             out[j * 4] = rgba[j * 4];
             out[j * 4 + 1] = rgba[j * 4 + 1];
             out[j * 4 + 2] = rgba[j * 4 + 2];
@@ -807,7 +843,7 @@ export class ObjectTracker {
         for (let y = 0; y < vh; y++) {
           for (let x = 0; x < vw; x++) {
             const i = y * vw + x;
-            if (out[i * 4 + 3] > 0 || fine[y * 2 * w + x * 2] >= 128 || this.likeYou(i, rgba)) continue;
+            if (out[i * 4 + 3] > 0 || you[y * 2 * w + x * 2] >= 128 || this.likeYou(i, rgba)) continue;
             const near =
               (x > 0 && out[(i - 1) * 4 + 3] > 102) || (x < vw - 1 && out[(i + 1) * 4 + 3] > 102) || (y > 0 && out[(i - vw) * 4 + 3] > 102) || (y < vh - 1 && out[(i + vw) * 4 + 3] > 102);
             if (near) mark[i] = 1;
