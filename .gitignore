@@ -36,3 +36,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# salidas de scripts/e2e.mjs y scripts/shots.mjs
+/e2e-out
+/shots

@@ -148,12 +148,25 @@ body {
   color: #1a1204;
   box-shadow: var(--shadow-amber);
   cursor: pointer;
+  flex: none;
   transition: transform 180ms var(--ease-spring), box-shadow 200ms, filter 160ms;
 }
 .rec-btn:hover { transform: scale(1.04); filter: brightness(1.05); }
 .rec-btn:active { transform: scale(0.97); }
 .rec-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 .rec-btn:focus-visible { outline: 2px solid var(--color-amber); outline-offset: 3px; }
+/* Arrancando (micrófono, cámara, cuenta atrás): anillo que gira, sin apagar el botón */
+.rec-btn[data-busy="true"] { opacity: 0.9; cursor: progress; }
+.rec-btn[data-busy="true"]::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: inherit;
+  border: 2px solid rgb(255 177 74 / 0.22);
+  border-top-color: var(--color-amber);
+  animation: spin 800ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .rec-btn[data-live="true"] {
   background: linear-gradient(180deg, #ff5b52 0%, #d92d24 100%);
   border-color: rgb(255 179 173 / 0.5);
@@ -249,22 +262,122 @@ body {
 
 /* ---------- Editor de guion ---------- */
 
+/* Primera pantalla del editor: ocupa justo el alto visible, con la barra de
+   acciones pegada abajo; así "Ir a grabar" nunca queda fuera de vista. */
+.editor-screen {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100dvh - 4rem);
+  padding-top: 1.25rem;
+}
+@media (min-width: 640px) {
+  .editor-screen { padding-top: 2.25rem; }
+}
+.editor-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-inline: -0.5rem;
+  padding: 0.85rem 0.5rem calc(0.85rem + env(safe-area-inset-bottom));
+  isolation: isolate;
+}
+/* velo tras la barra: tapa el texto que pasa por debajo y se funde a los lados */
+.editor-actions::before {
+  content: "";
+  position: absolute;
+  inset: 0 -1.5rem;
+  z-index: -1;
+  background: linear-gradient(0deg, var(--color-ink) 58%, transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 2.5rem, #000 calc(100% - 2.5rem), transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 2.5rem, #000 calc(100% - 2.5rem), transparent);
+  pointer-events: none;
+}
+.editor-empty {
+  position: absolute;
+  left: 1.25rem;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.editor-drop {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 1.25rem;
+  border: 2px dashed var(--color-amber);
+  background: rgb(25 22 20 / 0.92);
+  color: var(--color-amber-soft);
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.mode-card {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  min-height: 3.25rem;
+  padding: 0.6rem 0.85rem;
+  border-radius: 1rem;
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-surface);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 160ms var(--ease-out-quint), background-color 160ms var(--ease-out-quint), box-shadow 200ms;
+}
+.mode-card:hover { border-color: #5a4e44; }
+.mode-card:focus-visible { outline: 2px solid var(--color-amber); outline-offset: 2px; }
+.mode-card[aria-checked="true"] {
+  border-color: rgb(255 177 74 / 0.7);
+  background: rgb(255 177 74 / 0.1);
+  box-shadow: 0 0 0 1px rgb(255 177 74 / 0.3);
+}
+.mode-card-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 999px;
+  background: var(--color-surface-3);
+  color: var(--color-paper-dim);
+  transition: background-color 160ms, color 160ms;
+}
+.mode-card[aria-checked="true"] .mode-card-icon { background: var(--color-amber); color: #1a1204; }
+@media (min-width: 640px) {
+  .mode-card { align-items: flex-start; padding: 0.75rem 1rem; }
+}
+
 .script-editor {
+  position: absolute;
+  inset: 0;
   width: 100%;
-  min-height: 46vh;
-  resize: vertical;
+  height: 100%;
+  resize: none;
   border-radius: 1.25rem;
   border: 1px solid var(--color-line);
   background: var(--color-surface);
   color: var(--color-paper);
-  padding: 1.5rem 1.75rem;
+  padding: 1.25rem;
   font-family: var(--font-sans);
-  font-size: 1.125rem;
-  line-height: 1.7;
+  font-size: 1.0625rem;
+  line-height: 1.65;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
   box-shadow: var(--shadow-panel);
   transition: border-color 160ms, box-shadow 200ms;
 }
 .script-editor::placeholder { color: var(--color-paper-mute); }
+@media (min-width: 640px) {
+  .script-editor { padding: 1.5rem 1.75rem; font-size: 1.125rem; line-height: 1.7; }
+  .editor-empty { left: 1.75rem; right: 1.75rem; bottom: 1.5rem; }
+}
 .script-editor:focus { outline: none; border-color: rgb(255 177 74 / 0.6); box-shadow: var(--shadow-panel), 0 0 0 4px rgb(255 177 74 / 0.12); }
 
 /* ---------- Prompter (zona de lectura) ---------- */
@@ -496,7 +609,12 @@ body {
   z-index: 1;
 }
 .prompter::before { top: 0; background: linear-gradient(180deg, var(--color-ink), transparent); }
-.prompter::after { bottom: 0; background: linear-gradient(0deg, var(--color-ink), transparent); }
+.prompter::after {
+  bottom: 0;
+  height: max(18%, 11.5rem);
+  /* macizo en la franja del dock: el texto no se lee a través de los controles */
+  background: linear-gradient(0deg, var(--color-ink) 0, var(--color-ink) 7.25rem, transparent);
+}
 
 /* Variante tarjeta: sobre la cámara no hay negro detrás; el desvanecido va por máscara */
 .prompter[data-variant="card"]::before,
@@ -572,6 +690,10 @@ body {
 }
 .cue-grip:hover, .cue-grip:focus-visible { background: rgb(255 255 255 / 0.06); color: var(--color-paper); outline: none; }
 .cue-grip:active { cursor: grabbing; }
+/* Tarjeta angosta (móvil): la barra solo deja lo imprescindible */
+.cue-card[data-narrow="true"] .cue-grip-label,
+.cue-card[data-narrow="true"] .cue-bar .chip,
+.cue-card[data-narrow="true"] .cue-bar .gaze-pill { display: none; }
 .cue-mini {
   display: inline-grid;
   place-items: center;
@@ -657,6 +779,12 @@ body {
 .hud-tip.warn { border-color: rgb(255 59 48 / 0.45); color: #ffb3ad; }
 .hud-tip.info { border-color: rgb(255 177 74 / 0.4); color: var(--color-amber-soft); }
 .prompter + .studio-hud .hud-stack { top: 16px; }
+@media (max-width: 640px) {
+  /* arriba está la tarjeta del texto: los avisos bajan junto al dock */
+  .hud-stack, .prompter + .studio-hud .hud-stack { top: auto; bottom: 6.25rem; max-width: 46vw; }
+  .hud-right { right: 10px; }
+  .hud-left { left: 10px; }
+}
 
 /* Guías de encuadre: tercios + línea de ojos (antes de grabar) */
 .frame-guides {
@@ -761,6 +889,7 @@ body {
   background: rgb(10 9 8 / 0.75);
   border: 1px solid var(--color-line-strong);
   color: var(--color-paper-dim);
+  white-space: nowrap;
 }
 .chip-beta {
   font-family: var(--font-mono);
@@ -840,6 +969,11 @@ body {
   box-shadow: var(--shadow-dock);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
+}
+
+@media (max-width: 640px) {
+  .dock { gap: 0.5rem; padding: 0.5rem 0.6rem; }
+  .seg button { padding: 0 0.6rem; }
 }
 
 .dock-sep {
@@ -952,6 +1086,7 @@ body {
   .onair[data-live="true"] .onair-dot { animation: none; }
   .w { transition: none; }
   .countdown-num, .calib-dot::before { animation: none; }
+  .rec-btn[data-busy="true"]::after { animation-duration: 2.4s; }
   .read-marker { transition: none; }
   .prompter[data-live="true"][data-waiting="true"] .read-marker { animation: none; }
 }

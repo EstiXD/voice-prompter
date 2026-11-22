@@ -26,6 +26,10 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const cacheRef = useRef(new Map<string, Blob>());
+  // Salir sin haber descargado pierde la toma: se pide un segundo clic.
+  // (El panel se monta de nuevo en cada toma, así que este estado nace limpio.)
+  const [saved, setSaved] = useState(false);
+  const [confirm, setConfirm] = useState<"new" | "edit" | null>(null);
   const pct = wordsTotal > 0 ? Math.round((Math.max(0, wordsRead) / wordsTotal) * 100) : 0;
   const isVideo = recording?.kind === "video";
   const info = isVideo ? videoFormatInfo(videoFormat) : formatInfo(format);
@@ -42,11 +46,28 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
     cacheRef.current = new Map();
   }, [recording]);
 
+  // la confirmación caduca sola: un clic suelto más tarde no descarta nada
+  useEffect(() => {
+    if (!confirm) return;
+    const id = window.setTimeout(() => setConfirm(null), 5000);
+    return () => clearTimeout(id);
+  }, [confirm]);
+
+  const leave = (to: "new" | "edit") => {
+    if (recording && !saved && confirm !== to) {
+      setConfirm(to);
+      return;
+    }
+    if (to === "new") onNewTake();
+    else onEdit();
+  };
+
   const download = async () => {
     if (!recording || busy) return;
     const cached = cacheRef.current.get(key);
     if (cached) {
       downloadBlob(cached, takeFilename(ext));
+      setSaved(true);
       return;
     }
     setBusy(true);
@@ -57,6 +78,7 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
         : await convertRecording(recording.blob, format, { originalExt: recording.ext, onProgress: setProgress });
       cacheRef.current.set(key, out.blob);
       downloadBlob(out.blob, takeFilename(out.ext));
+      setSaved(true);
     } catch (err) {
       console.error(err);
       toast.error((err as Error).message || "No pude convertir la toma en este navegador.");
@@ -158,15 +180,20 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
           <p className="mt-4 text-sm text-paper-dim">La grabación quedó vacía. Revisa el micrófono{isVideo ? " y la cámara" : ""} e inténtalo de nuevo.</p>
         )}
 
-        <div className="mt-4 flex justify-between gap-2 border-t border-line pt-4">
-          <button type="button" className="btn btn-ghost" onClick={onEdit}>
-            <IconEdit className="h-4 w-4" />
-            Editar guion
-          </button>
-          <button type="button" className="btn" onClick={onNewTake}>
-            <IconRestart className="h-4 w-4" />
-            Nueva toma
-          </button>
+        <div className="mt-4 border-t border-line pt-4">
+          <div className="flex flex-wrap justify-between gap-2">
+            <button type="button" className={`btn ${confirm === "edit" ? "btn-danger" : "btn-ghost"}`} onClick={() => leave("edit")} disabled={busy}>
+              <IconEdit className="h-4 w-4" />
+              {confirm === "edit" ? "Sí, descartar y editar" : "Editar guion"}
+            </button>
+            <button type="button" className={`btn ${confirm === "new" ? "btn-danger" : ""}`} onClick={() => leave("new")} disabled={busy}>
+              <IconRestart className="h-4 w-4" />
+              {confirm === "new" ? "Sí, descartar y repetir" : "Nueva toma"}
+            </button>
+          </div>
+          <p className="mt-2 min-h-4 text-center text-xs text-[#ffb3ad]" role="status">
+            {confirm ? "Aún no descargaste esta toma: si sigues, se pierde." : ""}
+          </p>
         </div>
       </div>
     </div>

@@ -18,9 +18,12 @@ type Props = {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
+/** En pantallas angostas (móvil) la tarjeta va casi a todo el ancho: con menos no cabe una línea. */
+const NARROW_STAGE_PX = 560;
+
 /** Mantiene la tarjeta entera dentro del escenario. */
-function fit(g: CueGeometry): CueGeometry {
-  const w = clamp(g.w, 0.2, 0.95);
+function fit(g: CueGeometry, minW = 0.2): CueGeometry {
+  const w = clamp(g.w, minW, 0.95);
   const h = clamp(g.h, 0.12, 0.8);
   return { ...g, w, h, cx: clamp(g.cx, w / 2, 1 - w / 2), top: clamp(g.top, 0, 1 - h) };
 }
@@ -35,7 +38,9 @@ export function CueCard({ geom, onChange, quiet, extra, hud, children }: Props) 
   const [live, setLive] = useState<CueGeometry | null>(null);
   const [box, setBox] = useState({ w: 0, h: 0 });
   const dragRef = useRef<{ mode: "move" | "resize"; x: number; y: number; start: CueGeometry } | null>(null);
-  const g = fit(live ?? geom);
+  const minW = box.w > 0 && box.w < NARROW_STAGE_PX ? 0.92 : 0.2;
+  const g = fit(live ?? geom, minW);
+  const narrow = box.w > 0 && g.w * box.w < 420;
 
   // tamaño del escenario (padre)
   useEffect(() => {
@@ -107,7 +112,7 @@ export function CueCard({ geom, onChange, quiet, extra, hud, children }: Props) 
     : { left: "28%", top: "2%", width: "44%", height: "24%" };
 
   return (
-    <div ref={rootRef} className="cue-card" style={style} data-dragging={live ? "true" : "false"} data-quiet={quiet ? "true" : "false"}>
+    <div ref={rootRef} className="cue-card" style={style} data-dragging={live ? "true" : "false"} data-quiet={quiet ? "true" : "false"} data-narrow={narrow ? "true" : "false"}>
       <div className="cue-bar">
         <button
           type="button"
@@ -122,7 +127,7 @@ export function CueCard({ geom, onChange, quiet, extra, hud, children }: Props) 
           title="Arrastra para mover · doble clic: volver bajo la cámara"
         >
           <IconGrip className="h-4 w-4" />
-          Arrastra
+          <span className="cue-grip-label">Arrastra</span>
         </button>
         <span className="flex-1" />
         {extra}

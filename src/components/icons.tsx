@@ -242,3 +242,18 @@ export const IconFace = (p: IconProps) => (
     <path d="M8.8 14.6a4.2 4.2 0 0 0 6.4 0" />
   </svg>
 );
+
+export const IconClipboard = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="6" y="5" width="12" height="16" rx="2" />
+    <path d="M9 5V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1" />
+    <path d="M9.5 11h5M9.5 15h3" />
+  </svg>
+);
+
+export const IconFile = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M14 3H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7z" />
+    <path d="M14 3v4h4" />
+  </svg>
+);

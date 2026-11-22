@@ -393,7 +393,8 @@ export function PrompterApp() {
       const target = e.target as HTMLElement | null;
       if (target && (EDITABLE.has(target.tagName) || target.isContentEditable)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (phase === "edit" || guideVisible) return;
+      // con la toma terminada no hay atajos: Espacio no debe descartarla sin querer
+      if (phase === "edit" || phase === "finished" || guideVisible) return;
       if (countdownCancelRef.current && (e.code === "Escape" || e.code === "Space")) {
         e.preventDefault();
         countdownCancelRef.current();
@@ -402,10 +403,8 @@ export function PrompterApp() {
       switch (e.code) {
         case "Space":
           e.preventDefault();
-          if (phase === "ready" || phase === "finished") {
-            if (phase === "finished") newTake();
-            void startRecording();
-          } else if (phase === "recording") pauseRecording();
+          if (phase === "ready") void startRecording();
+          else if (phase === "recording") pauseRecording();
           else if (phase === "paused") resumeRecording();
           break;
         case "ArrowRight":
@@ -436,7 +435,7 @@ export function PrompterApp() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [phase, startRecording, pauseRecording, resumeRecording, newTake, alignNudge, toggleStage, settingsOpen, lookOpen, stage, guideVisible]);
+  }, [phase, startRecording, pauseRecording, resumeRecording, alignNudge, toggleStage, settingsOpen, lookOpen, stage, guideVisible]);
 
   const onSilence = useCallback((silent: boolean) => {
     if (silent && !silenceWarnedRef.current) {
@@ -477,7 +476,7 @@ export function PrompterApp() {
     <div className="flex h-dvh flex-col">
       {!stage && (
         <header className="fade flex h-14 flex-none items-center justify-between px-4 sm:px-6">
-          <div className="flex min-w-0 items-center gap-4">
+          <div className="flex min-w-0 items-center gap-2 sm:gap-4">
             <span className="wordmark whitespace-nowrap text-xl text-paper sm:text-2xl">Voice Prompter</span>
             {phase !== "edit" && <ModeSwitch mode={settings.mode} onMode={setMode} disabled={isLive || phase === "starting"} />}
             {phase === "edit" && <span className="hidden text-xs text-paper-mute md:inline">teleprompter que sigue tu voz</span>}
@@ -492,11 +491,12 @@ export function PrompterApp() {
                 Editar guion
               </button>
             )}
-            <button type="button" className="btn btn-ghost btn-icon" onClick={() => setSettingsOpen(true)} aria-label="Ajustes" title="Ajustes">
+            {/* en móvil, con el guion listo, Ajustes vive en el dock: aquí no cabe junto al selector de modo */}
+            <button type="button" className={`btn btn-ghost btn-icon ${phase === "edit" ? "" : "hidden sm:inline-flex"}`} onClick={() => setSettingsOpen(true)} aria-label="Ajustes" title="Ajustes">
               <IconSliders className="h-5 w-5" />
             </button>
             {phase !== "edit" && (
-              <button type="button" className="btn btn-ghost btn-icon" onClick={toggleStage} aria-label="Modo escenario" title="Modo escenario (F)">
+              <button type="button" className="btn btn-ghost btn-icon hidden sm:inline-flex" onClick={toggleStage} aria-label="Modo escenario" title="Modo escenario (F)">
                 <IconExpand className="h-5 w-5" />
               </button>
             )}

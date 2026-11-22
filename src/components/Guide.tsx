@@ -65,10 +65,10 @@ export function Guide({ open, mode, onClose }: Props) {
           ))}
         </ol>
         <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
-          <p className="text-xs text-paper-mute">
+          <p className="text-xs text-paper-mute pointer-coarse:hidden">
             <kbd className="kbd">Espacio</kbd> grabar/pausar · <kbd className="kbd">F</kbd> pantalla completa · <kbd className="kbd">← →</kbd> mover cursor
           </p>
-          <button type="button" className="btn btn-primary" onClick={onClose} autoFocus>
+          <button type="button" className="btn btn-primary ml-auto h-11 px-6" onClick={onClose} autoFocus>
             Entendido
           </button>
         </div>

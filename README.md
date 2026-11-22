@@ -103,6 +103,13 @@ pnpm typecheck
 pnpm build
 ```
 
+### Capturas de cada pantalla (`scripts/shots.mjs`)
+
+Con `pnpm dev` corriendo, `node scripts/shots.mjs --out shots` guarda una captura de cada
+pantalla (editor, guía, voz, cámara, descarga) en escritorio y en móvil. Sirve para revisar
+un cambio de interfaz de un vistazo. Usa un micrófono sintético, así que no mide el seguimiento
+de voz: para eso está la prueba de abajo.
+
 ### Prueba de punta a punta (`scripts/e2e.mjs`)
 
 Abre Google Chrome con micrófono y cámara simulados (`--use-file-for-fake-*`),
