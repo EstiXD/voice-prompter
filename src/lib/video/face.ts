@@ -34,6 +34,13 @@ export type EyeGeom = {
   width: number;
   /** apertura párpado superior–inferior (px) */
   open: number;
+  /**
+   * Cuánto se abre el ojo por ENCIMA y por DEBAJO de la línea de las comisuras
+   * (px). No es mitad y mitad: el párpado de arriba hace casi todo el arco y
+   * el de abajo queda cerca de la línea, y mirando abajo aún más.
+   */
+  above: number;
+  below: number;
   /** ángulo del eje del ojo (rad) */
   angle: number;
   iris: Pt;
@@ -60,13 +67,21 @@ export function eyeGeom(px: readonly Pt[], side: "R" | "L"): EyeGeom | null {
   if (width < 4) return null;
   let r = 0;
   for (const i of ring) r += len(sub(px[i], iris));
+  const center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  const angle = Math.atan2(axis.y, axis.x);
+  // distancia de cada párpado a la línea de las comisuras. El eje del ojo
+  // izquierdo apunta al revés (externa → interna), y con él su perpendicular.
+  const flip = Math.cos(angle) >= 0 ? 1 : -1;
+  const perp = (p: Pt) => (-(p.x - center.x) * Math.sin(angle) + (p.y - center.y) * Math.cos(angle)) * flip;
   return {
     a,
     b,
-    center: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    center,
     width,
     open: len(sub(lo, up)),
-    angle: Math.atan2(axis.y, axis.x),
+    above: Math.max(1, -perp(up)),
+    below: Math.max(1, perp(lo)),
+    angle,
     iris,
     irisR: r / ring.length,
   };
@@ -514,6 +529,14 @@ export function eyeRoi(e: EyeGeom, w: number, h: number): { x: number; y: number
   return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
 }
 
+/**
+ * Cuánto más allá del párpado medido (en aperturas del ojo) se sigue moviendo
+ * el iris entero. Abajo hace falta más: el punto del párpado inferior cae
+ * sobre el borde de las pestañas, un par de píxeles por encima de donde de
+ * verdad termina lo que se ve del ojo.
+ */
+export const EYE_SHAPE = { IRIS_PAST_UPPER: 0.1, IRIS_PAST_LOWER: 0.22 };
+
 /** Hasta dónde llega (px) la zona que se mueve con el iris. */
 export function irisReach(e: EyeGeom): number {
   return Math.max(e.irisR * 1.6, e.width * 0.22);
@@ -541,37 +564,44 @@ export function warpEye(src: Uint8ClampedArray, dst: Uint8ClampedArray, w: numbe
   const cos = Math.cos(e.angle);
   const sin = Math.sin(e.angle);
   const ax = e.width / 2;
-  const ay = Math.max(1, e.open / 2);
+  const flip = Math.sign(cos || 1);
   const reach = irisReach(e);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const dx = x + 0.5 - e.center.x;
       const dy = y + 0.5 - e.center.y;
-      // dentro de la elipse del ojo (rotada), con borde suave
+      // dentro del ojo (dos medias elipses rotadas: la de arriba más alta que
+      // la de abajo), con borde suave. Con una sola elipse simétrica, la piel
+      // del párpado inferior caía "dentro" y se estiraba como si fuera ojo.
       const u = (dx * cos + dy * sin) / ax;
       const vr = -dx * sin + dy * cos;
-      const v = vr / ay;
-      const ell = Math.sqrt(u * u + v * v);
-      let wx: number;
-      let wy: number;
-      if (ell < 1) {
+      const upper = vr * flip < 0;
+      const open = e.above + e.below;
+      const ay = Math.max(1, upper ? e.above : e.below);
+      const ell = Math.hypot(u, vr / ay);
+      // El iris llega un poco más allá de donde los puntos de la cara ponen el
+      // párpado (sobre todo abajo): si el peso cayera a cero justo ahí, la
+      // parte del iris pegada al párpado se quedaría quieta y el iris saldría
+      // "mordido". Por eso el iris tiene su propio límite, algo más holgado.
+      const ellIris = Math.hypot(u, vr / (ay + open * (upper ? EYE_SHAPE.IRIS_PAST_UPPER : EYE_SHAPE.IRIS_PAST_LOWER)));
+      let wx = 0;
+      let wy = 0;
+      if (ellIris < 1) {
         // El iris se traslada RÍGIDO (peso 1 en todo su disco, si no se
-        // deforma en óvalo); la caída va solo por la esclerótica, hasta el
-        // borde de los párpados, donde el peso es 0 y no hay costura.
+        // deforma en óvalo). La esclerótica acompaña un 30 % y cae a cero en
+        // el borde de los párpados: la piel no se estira y no hay costura.
         const edge = 1 - smooth01((ell - 0.78) / 0.22);
+        const edgeIris = 1 - smooth01((ellIris - 0.85) / 0.15);
         const di = Math.hypot(x + 0.5 - e.iris.x - shift.x, y + 0.5 - e.iris.y - shift.y);
         const core = 1 - smooth01((di - e.irisR * 1.15) / Math.max(1, reach - e.irisR * 1.15));
-        wx = wy = edge * Math.max(0.3, core);
-      } else {
+        wx = wy = Math.max(core * edgeIris, 0.3 * edge);
+      }
+      if (ell >= 1 && shift.y) {
         // Párpados: acompañan el movimiento vertical como en un ojo real
         // (mirar arriba sube el superior ~2/3 y el inferior ~1/4). Sin esto
         // el iris "subido" queda tapado y se ve raro.
-        if (!shift.y) continue;
-        const upper = vr * Math.sign(cos || 1) < 0;
-        const ext = Math.sqrt(u * u + (vr / (ay * (upper ? 2.1 : 1.7))) ** 2);
-        if (ext >= 1) continue;
-        wx = 0;
-        wy = (1 - smooth01((ext - 0.45) / 0.55)) * (upper ? 0.62 : 0.25);
+        const ext = Math.hypot(u, vr / (ay + open * (upper ? 0.55 : 0.35)));
+        if (ext < 1) wy = Math.max(wy, (1 - smooth01((ext - 0.45) / 0.55)) * (upper ? 0.62 : 0.25));
       }
       if (wx <= 0.001 && wy <= 0.001) continue;
       const sx = x - shift.x * wx;

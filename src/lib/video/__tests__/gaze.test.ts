@@ -10,7 +10,10 @@ import {
   gazeDistance,
   gazeToCamera,
   headPose,
+  LM,
+  eyeGeom,
   movedEye,
+  warpEye,
   readGaze,
   type EyeGeom,
   type Gaze,
@@ -241,9 +244,103 @@ describe("GazeMeter", () => {
   });
 });
 
+describe("forma del ojo", () => {
+  /** Malla mínima con un ojo: comisuras en y=100, párpado de arriba 14 px por encima y el de abajo 4 px por debajo. */
+  function mesh(side: "R" | "L") {
+    const pts = Array.from({ length: 478 }, () => ({ x: 0, y: 0 }));
+    const [outer, inner, upper, lower, iris, ring] =
+      side === "R"
+        ? [LM.R_OUTER, LM.R_INNER, LM.R_UPPER, LM.R_LOWER, LM.R_IRIS, LM.R_IRIS_RING]
+        : [LM.L_OUTER, LM.L_INNER, LM.L_UPPER, LM.L_LOWER, LM.L_IRIS, LM.L_IRIS_RING];
+    // en la imagen la comisura externa del ojo derecho queda a la izquierda; la del izquierdo, a la derecha
+    pts[outer] = { x: side === "R" ? 100 : 160, y: 100 };
+    pts[inner] = { x: side === "R" ? 160 : 100, y: 100 };
+    pts[upper] = { x: 130, y: 86 };
+    pts[lower] = { x: 130, y: 104 };
+    pts[iris] = { x: 130, y: 96 };
+    ring.forEach((i, k) => (pts[i] = { x: 130 + 8 * Math.cos((k * Math.PI) / 2), y: 96 + 8 * Math.sin((k * Math.PI) / 2) }));
+    return pts;
+  }
+
+  it("mide la apertura por encima y por debajo de las comisuras, en los dos ojos", () => {
+    for (const side of ["R", "L"] as const) {
+      const e = eyeGeom(mesh(side), side)!;
+      expect(e.above).toBeCloseTo(14, 5);
+      expect(e.below).toBeCloseTo(4, 5);
+      expect(e.open).toBeCloseTo(18, 5);
+    }
+  });
+
+  it("un ojo casi cerrado no da aperturas negativas", () => {
+    const pts = mesh("R");
+    pts[LM.R_UPPER] = { x: 130, y: 101 }; // el párpado de arriba por debajo de la línea
+    const e = eyeGeom(pts, "R")!;
+    expect(e.above).toBe(1);
+    expect(e.below).toBeGreaterThanOrEqual(1);
+  });
+
+  it("la piel bajo el párpado inferior no se estira como si fuera ojo", () => {
+    const w = 80;
+    const h = 60;
+    // ojo que abre 14 px arriba y 4 abajo de las comisuras (y = 30)
+    const e: EyeGeom = { a: { x: 10, y: 30 }, b: { x: 70, y: 30 }, center: { x: 40, y: 30 }, width: 60, open: 18, above: 14, below: 4, angle: 0, iris: { x: 40, y: 26 }, irisR: 8 };
+    const src = new Uint8ClampedArray(w * h * 4);
+    // degradado horizontal: cualquier desplazamiento lateral cambia el valor
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        src[i] = src[i + 1] = src[i + 2] = x * 3;
+        src[i + 3] = 255;
+      }
+    const dst = new Uint8ClampedArray(src.length);
+    warpEye(src, dst, w, h, e, { x: 5, y: 0 });
+    const px = (buf: Uint8ClampedArray, x: number, y: number) => buf[(y * w + x) * 4];
+    // 6 px bajo las comisuras, lejos del iris: con una elipse simétrica (±9)
+    // esto era "ojo" y se estiraba; ahora es párpado y no se toca
+    expect(px(dst, 18, 36)).toBe(px(src, 18, 36));
+    expect(px(dst, 60, 36)).toBe(px(src, 60, 36));
+    // bien por debajo del ojo, tampoco
+    expect(px(dst, 40, 40)).toBe(px(src, 40, 40));
+    // dentro del ojo, arriba de las comisuras, sí se mueve
+    expect(px(dst, 40, 24)).not.toBe(px(src, 40, 24));
+  });
+
+  it("el iris se mueve entero aunque asome bajo el párpado medido (no sale mordido)", () => {
+    const w = 80;
+    const h = 60;
+    // iris de radio 8 centrado 2 px sobre las comisuras: baja hasta 6 px por debajo, y el párpado medido está a 4
+    const e: EyeGeom = { a: { x: 10, y: 30 }, b: { x: 70, y: 30 }, center: { x: 40, y: 30 }, width: 60, open: 18, above: 14, below: 4, angle: 0, iris: { x: 40, y: 28 }, irisR: 8 };
+    const src = new Uint8ClampedArray(w * h * 4);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        src[i] = src[i + 1] = src[i + 2] = Math.hypot(x + 0.5 - 40, y + 0.5 - 28) < 8 ? 0 : 255;
+        src[i + 3] = 255;
+      }
+    const dst = new Uint8ClampedArray(src.length);
+    warpEye(src, dst, w, h, e, { x: 4, y: 0 });
+    // centro (en x) de lo oscuro en una fila
+    const rowCenter = (buf: Uint8ClampedArray, y: number) => {
+      let sx = 0;
+      let n = 0;
+      for (let x = 0; x < w; x++)
+        if (buf[(y * w + x) * 4] < 100) {
+          sx += x;
+          n++;
+        }
+      return n ? sx / n : NaN;
+    };
+    // la fila del medio del iris y la de abajo (1 px bajo el párpado medido) se corren lo mismo
+    const mid = rowCenter(dst, 27) - rowCenter(src, 27);
+    const low = rowCenter(dst, 34) - rowCenter(src, 34);
+    expect(mid).toBeGreaterThan(3);
+    expect(low).toBeGreaterThan(3);
+  });
+});
+
 describe("movedEye", () => {
   it("traslada el ojo entero sin deformarlo", () => {
-    const e: EyeGeom = { a: { x: 20, y: 20 }, b: { x: 60, y: 20 }, center: { x: 40, y: 20 }, width: 40, open: 18, angle: 0, iris: { x: 42, y: 21 }, irisR: 6 };
+    const e: EyeGeom = { a: { x: 20, y: 20 }, b: { x: 60, y: 20 }, center: { x: 40, y: 20 }, width: 40, open: 18, above: 9, below: 9, angle: 0, iris: { x: 42, y: 21 }, irisR: 6 };
     const m = movedEye(e, 3, -2);
     expect(m.center).toEqual({ x: 43, y: 18 });
     expect(m.iris).toEqual({ x: 45, y: 19 });

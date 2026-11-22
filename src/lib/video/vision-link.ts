@@ -6,7 +6,7 @@
 import type { VisionDelegate, VisionRequest, VisionResponse, VisionRole } from "@/workers/vision.worker";
 
 export type LinkState = "off" | "loading" | "ready" | "error";
-export type MaskResult = { id: number; w: number; h: number; data: Uint8Array };
+export type MaskResult = { id: number; w: number; h: number; data: Uint8Array; /** el cuadro a media resolución (RGBA), si se pidió */ pixels?: Uint8Array };
 export type FaceResult = { id: number; points: Float32Array | null; pose: Float32Array | null };
 
 const WASM_BASE = "/mediapipe";
@@ -72,11 +72,11 @@ export class VisionLink {
   }
 
   /** Manda un cuadro (el bitmap pasa a ser del worker). false = no se pudo: ciérralo tú. */
-  send(id: number, ts: number, bitmap: ImageBitmap): boolean {
+  send(id: number, ts: number, bitmap: ImageBitmap, pixels = false): boolean {
     if (!this.worker || this.state !== "ready" || this.busy) return false;
     this.busy = true;
     this.sentAt = performance.now();
-    const msg: VisionRequest = { type: "frame", id, ts, bitmap };
+    const msg: VisionRequest = { type: "frame", id, ts, bitmap, pixels };
     try {
       this.worker.postMessage(msg, [bitmap]);
       return true;

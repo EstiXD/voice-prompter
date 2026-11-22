@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MaskCleaner, maskDrift, solidEllipse, toBytes, vetoMap } from "../mask";
+import { MaskCleaner, maskDrift, OBJECT, ObjectTracker, solidEllipse, toBytes, vetoMap } from "../mask";
 
 const W = 64;
 const H = 48;
@@ -155,6 +155,102 @@ describe("vetoMap", () => {
     const { out, hits } = run(m, m);
     expect(hits).toBe(0);
     expect(Math.max(...out)).toBe(0);
+  });
+});
+
+describe("ObjectTracker", () => {
+  const VW = W >> 1;
+  const VH = H >> 1;
+  const N = VW * VH;
+  const WALL = [220, 210, 185];
+  const CHAIR = [230, 110, 20];
+  const SHIRT = [228, 228, 236];
+  /** Cuadro a media resolución: pared por todas partes y, en los rectángulos dados, otro color. */
+  const frame = (rects: [number, number, number, number, number[]][]) => {
+    const px = new Uint8Array(N * 4);
+    for (let i = 0; i < N; i++) px.set([...WALL, 255], i * 4);
+    for (const [x0, y0, x1, y1, c] of rects) for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) px.set([...c, 255], (y * VW + x) * 4);
+    return px;
+  };
+  const half = (rects: [number, number, number, number, number][]) => paint(new Uint8Array(N), VW, rects);
+  const person = u8([[16, 8, 40, 46, 255]]); // tú, a resolución completa
+  const chairPx = frame([[22, 10, 28, 20, CHAIR]]); // la silla, junto a tu hombro
+  const chairSeed = half([[22, 10, 28, 20, 255]]);
+  const firm = (m: Uint8Array, x: number, y: number) => at(m, x, y, VW) > 102; // lo que el sombreador ya aplica entero
+
+  it("una sola siembra no basta; dos sobre lo mismo dejan el objeto firme", () => {
+    const t = new ObjectTracker();
+    let o = t.update(chairSeed, person, chairPx, VW, VH, W);
+    expect(at(o, 24, 15, VW)).toBe(OBJECT.CANDIDATE);
+    expect(firm(o, 24, 15)).toBe(false);
+    o = t.update(chairSeed, person, chairPx, VW, VH, W);
+    expect(at(o, 24, 15, VW)).toBe(255);
+  });
+
+  it("firme, sigue ahí muchas pasadas aunque el modelo rápido deje de reclamarlo", () => {
+    const t = new ObjectTracker();
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    let o: Uint8Array = new Uint8Array(0);
+    for (let i = 0; i < 8; i++) o = t.update(half([]), person, chairPx, VW, VH, W);
+    expect(firm(o, 24, 15)).toBe(true);
+    for (let i = 0; i < 12; i++) o = t.update(half([]), person, chairPx, VW, VH, W);
+    expect(firm(o, 24, 15)).toBe(false); // y al final se suelta sola
+  });
+
+  it("un brazo que cruzó en una pasada no deja nada", () => {
+    const t = new ObjectTracker();
+    // el modelo rápido reclamó tu brazo (el fino no llegó a verlo): una siembra sobre color de camisa
+    t.update(half([[30, 4, 36, 8, 255]]), person, frame([[30, 4, 36, 8, SHIRT]]), VW, VH, W);
+    let o: Uint8Array = new Uint8Array(0);
+    for (let i = 0; i < 4; i++) o = t.update(half([]), person, frame([]), VW, VH, W);
+    expect(at(o, 32, 6, VW)).toBe(0);
+  });
+
+  it("lo que reclama de más alrededor de una mano es pared: por mucho que se repita, no es objeto", () => {
+    const t = new ObjectTracker();
+    const ring = half([[30, 2, 38, 8, 255]]); // junto a la mano levantada, todo color de pared
+    let o: Uint8Array = new Uint8Array(0);
+    for (let i = 0; i < 6; i++) o = t.update(ring, person, frame([]), VW, VH, W);
+    expect(at(o, 34, 5, VW)).toBe(0);
+  });
+
+  it("la silla se reconoce aunque en la misma pasada haya semillas de pared", () => {
+    const t = new ObjectTracker();
+    const both = half([
+      [22, 10, 28, 20, 255],
+      [30, 2, 38, 8, 255],
+    ]);
+    t.update(both, person, chairPx, VW, VH, W);
+    const o = t.update(both, person, chairPx, VW, VH, W);
+    expect(at(o, 24, 15, VW)).toBe(255);
+    expect(at(o, 34, 5, VW)).toBe(0);
+  });
+
+  it("si la silla se mueve, lo viejo se suelta en el acto", () => {
+    const t = new ObjectTracker();
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    const o = t.update(half([]), person, frame([]), VW, VH, W); // ahí ahora se ve la pared
+    expect(at(o, 24, 15, VW)).toBe(0);
+  });
+
+  it("donde el modelo fino te ve a ti, no hay objeto", () => {
+    const t = new ObjectTracker();
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    const overIt = u8([[40, 16, 60, 44, 255]]); // te moviste encima de la silla
+    const o = t.update(half([]), overIt, chairPx, VW, VH, W);
+    expect(at(o, 24, 15, VW)).toBe(0);
+  });
+
+  it("no crece hacia lo que se le parece: la pared junto a la silla no entra", () => {
+    const t = new ObjectTracker();
+    t.update(chairSeed, person, chairPx, VW, VH, W);
+    const o = t.update(chairSeed, person, chairPx, VW, VH, W);
+    let marked = 0;
+    for (let i = 0; i < N; i++) if (o[i] > 0) marked++;
+    expect(marked).toBe(6 * 10);
   });
 });
 

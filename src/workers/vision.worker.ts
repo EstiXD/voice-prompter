@@ -15,11 +15,12 @@ export type VisionDelegate = "GPU" | "CPU";
 
 export type VisionRequest =
   | { type: "init"; gen: number; role: VisionRole; wasmBase: string; model: string; delegate: VisionDelegate }
-  | { type: "frame"; id: number; ts: number; bitmap: ImageBitmap };
+  /** `pixels`: devolver además el cuadro a media resolución (RGBA), para aprender colores */
+  | { type: "frame"; id: number; ts: number; bitmap: ImageBitmap; pixels?: boolean };
 
 export type VisionResponse =
   | { type: "ready"; gen: number; model: string; delegate: VisionDelegate }
-  | { type: "mask"; id: number; w: number; h: number; data: Uint8Array; ms: number }
+  | { type: "mask"; id: number; w: number; h: number; data: Uint8Array; ms: number; pixels?: Uint8Array }
   /**
    * puntos de la cara normalizados (x, y por punto) o null si no hay cara;
    * `pose`: matriz 4×4 (por columnas) de la cabeza en el espacio de la cámara
@@ -101,9 +102,25 @@ async function init(msg: Extract<VisionRequest, { type: "init" }>) {
   }
 }
 
-function runSeg(id: number, ts: number, bitmap: ImageBitmap) {
+let pixCanvas: OffscreenCanvas | null = null;
+
+/** El cuadro a media resolución, en RGBA (se lee aquí, en el worker, para no frenar a nadie). */
+function halfPixels(bitmap: ImageBitmap): Uint8Array | undefined {
+  const pw = bitmap.width >> 1;
+  const ph = bitmap.height >> 1;
+  if (pw < 2 || ph < 2) return undefined;
+  if (!pixCanvas || pixCanvas.width !== pw || pixCanvas.height !== ph) pixCanvas = new OffscreenCanvas(pw, ph);
+  const ctx = pixCanvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return undefined;
+  ctx.drawImage(bitmap, 0, 0, pw, ph);
+  const img = ctx.getImageData(0, 0, pw, ph).data;
+  return new Uint8Array(img.buffer, img.byteOffset, img.byteLength);
+}
+
+function runSeg(id: number, ts: number, bitmap: ImageBitmap, wantPixels: boolean) {
   const t0 = performance.now();
   let sent = false;
+  const pixels = wantPixels ? halfPixels(bitmap) : undefined;
   segmenter!.segmentForVideo(bitmap, ts, (res) => {
     const masks = res.confidenceMasks;
     if (!masks?.length) return;
@@ -119,7 +136,7 @@ function runSeg(id: number, ts: number, bitmap: ImageBitmap) {
       toBytes(m.getAsFloat32Array(), out);
     }
     sent = true;
-    scope.postMessage({ type: "mask", id, w, h, data: out, ms: performance.now() - t0 }, [out.buffer]);
+    scope.postMessage({ type: "mask", id, w, h, data: out, ms: performance.now() - t0, pixels }, pixels ? [out.buffer, pixels.buffer] : [out.buffer]);
   });
   // sin máscara hay que contestar igual: el hilo principal espera para mandar el siguiente
   if (!sent) scope.postMessage({ type: "mask", id, w: 0, h: 0, data: new Uint8Array(0), ms: performance.now() - t0 });
@@ -154,7 +171,7 @@ scope.onmessage = (e) => {
   const ts = Math.max(msg.ts, lastTs + 1);
   lastTs = ts;
   try {
-    if (role === "seg" && segmenter) runSeg(id, ts, bitmap);
+    if (role === "seg" && segmenter) runSeg(id, ts, bitmap, !!msg.pixels);
     else if (role === "face" && face) runFace(id, ts, bitmap);
     else if (role === "seg") scope.postMessage({ type: "mask", id, w: 0, h: 0, data: new Uint8Array(0), ms: 0 });
     else scope.postMessage({ type: "face", id, points: null, pose: null, ms: 0 });

@@ -204,15 +204,17 @@ const ramp = (a: number, b: number, x: number) => (x <= a ? 0 : x >= b ? 1 : (x 
  *      el borde—; solo quedan las manchas con cuerpo, como una silla;
  *   3. se ensancha para cubrir el borde dudoso de la mancha, pero nunca sobre
  *      lo que el fino sí considera persona.
- * Devuelve cuántos píxeles (de media resolución) quedaron vetados.
+ * `spread`: cuánto se ensancha al final (3 para vetar con margen; 1 para
+ * quedarse con la mancha tal cual). Devuelve cuántos píxeles (de media
+ * resolución) quedaron marcados.
  */
-export function vetoMap(fast: Uint8Array, fine: Uint8Array, w: number, h: number, out: Uint8Array, tmp: Uint8Array): number {
+export function vetoMap(fast: Uint8Array, fine: Uint8Array, w: number, h: number, out: Uint8Array, tmp: Uint8Array, spread = 3): number {
   const vw = w >> 1;
   const vh = h >> 1;
   for (let y = 0; y < vh; y++) {
     for (let x = 0; x < vw; x++) {
       const i = y * 2 * w + x * 2;
-      out[y * vw + x] = (ramp(64, 115, fast[i]) * (1 - ramp(50, 140, fine[i])) * 255 + 0.5) | 0;
+      out[y * vw + x] = (ramp(64, 115, fast[i]) * (1 - ramp(90, 170, fine[i])) * 255 + 0.5) | 0;
     }
   }
   // erosión 3×3 (mínimo separable): fuera lo que tenga menos de 3 px de grueso
@@ -241,8 +243,8 @@ export function vetoMap(fast: Uint8Array, fine: Uint8Array, w: number, h: number
     out.fill(0, 0, vw * vh);
     return 0;
   }
-  // dilatación de radio 3 (máximo separable): recupera lo erosionado y cubre el borde
-  const R = 3;
+  // dilatación (máximo separable): con radio 1 recupera lo erosionado; con más, cubre además el borde
+  const R = spread;
   for (let y = 0; y < vh; y++) {
     const row = y * vw;
     for (let x = 0; x < vw; x++) {
@@ -258,7 +260,7 @@ export function vetoMap(fast: Uint8Array, fine: Uint8Array, w: number, h: number
     const y1 = y + R >= vh ? vh - 1 : y + R;
     for (let x = 0; x < vw; x++) {
       // lo que el fino ve como persona no se veta por vecindad
-      if (fine[y * 2 * w + x * 2] >= 90) {
+      if (fine[y * 2 * w + x * 2] >= 150) {
         out[y * vw + x] = 0;
         continue;
       }
@@ -271,6 +273,227 @@ export function vetoMap(fast: Uint8Array, fine: Uint8Array, w: number, h: number
     }
   }
   return hits;
+}
+
+export const OBJECT = {
+  /**
+   * Diferencia de color (suma de los tres canales, 0–765) hasta la que un
+   * punto "sigue siendo el mismo". Ajustado: una camisa blanca y una cortina
+   * crema se llevan ~85, y no son lo mismo.
+   */
+  SAME: 45,
+  /** cuánto conserva por pasada un punto que el modelo rápido no volvió a reclamar */
+  KEEP: 0.92,
+  /**
+   * Un punto sembrado una sola vez es candidato (este valor, que todavía no
+   * se aplica); al sembrarse otra vez mientras siga vivo pasa a firme. Un
+   * brazo que cruzó en una pasada no vuelve a sembrar el mismo sitio; la
+   * silla, que no se mueve, sí.
+   */
+  CANDIDATE: 60,
+  /** por debajo de esto un candidato se da por perdido (≈3 pasadas sin repetir) */
+  CANDIDATE_MIN: 48,
+  /**
+   * El modelo rápido también reclama de más alrededor de una mano levantada,
+   * y eso es pared. Para distinguirlo de una silla: el color de la pared está
+   * por todas partes, también LEJOS de la mancha; el naranja de una silla solo
+   * está en la silla. Una mancha de semillas vale como objeto si al menos
+   * BLOB_RARE de sus puntos tienen un color que lejos de las semillas casi no
+   * aparece (menos de FAR_SHARE de lo que hay allí). Se decide por mancha
+   * entera: así las franjas negras de la silla entran con las naranjas.
+   */
+  FAR_SHARE: 0.015,
+  BLOB_RARE: 0.35,
+  /** manchas más chicas que esto (puntos a media resolución) no cuentan */
+  BLOB_MIN: 6,
+  /** "lejos": fuera de las casillas de este ancho (fracción de la imagen) que tocan una semilla, y de sus vecinas */
+  NEAR_TILE: 0.07,
+  /** si lo que queda lejos es menos que esta fracción de la imagen, no hay con qué comparar: no se admite nada */
+  FAR_MIN: 0.08,
+};
+
+/** casilla de color gruesa: 8 niveles por canal */
+const colorBin = (rgba: Uint8Array, i: number) => ((rgba[i * 4] >> 5) << 6) | ((rgba[i * 4 + 1] >> 5) << 3) | (rgba[i * 4 + 2] >> 5);
+
+/**
+ * "Objeto pegado a ti": tu silla, un cojín, el respaldo. El modelo rápido lo
+ * toma por persona a ratos y a trozos, y de ahí el parpadeo. En vez de
+ * pelearse con él, lo que reclama se RECUERDA y se deja fijo:
+ *
+ *   · semillas: lo que el modelo rápido reclama y el fino, en el mismo
+ *     cuadro, dice que no eres tú (ver `vetoMap`);
+ *   · cada punto sembrado guarda el color que tenía; con dos siembras sobre
+ *     el mismo color queda firme. Desde entonces sigue siendo objeto mientras
+ *     conserve ese color, aunque el modelo rápido esta vez no lo reclame (se
+ *     va aflojando muy despacio);
+ *   · si el color cambió (moviste la silla, pusiste otra cosa) o el fino ve
+ *     ahí una persona, se suelta en el acto.
+ *
+ * A propósito NO crece por parecido de color hacia el resto del objeto: se
+ * probó y, en una habitación real, se llevaba la cortina y la pared. Así
+ * cubre solo lo que el modelo rápido ya incluía, pero entero y sin parpadeo.
+ *
+ * Todo a media resolución. Puro: con tests.
+ */
+export class ObjectTracker {
+  private acc: Uint8Array | null = null;
+  /** color (RGB) de cada punto cuando se sembró */
+  private col: Uint8Array | null = null;
+  private readonly farBins = new Uint32Array(512);
+  /** 0 = sin mirar · 1 = semilla admitida · 2 = semilla descartada */
+  private ok: Uint8Array | null = null;
+  private stack: Int32Array | null = null;
+
+  reset(): void {
+    this.acc?.fill(0);
+  }
+
+  /**
+   * Qué semillas son de verdad un objeto (ver OBJECT.FAR_SHARE). Devuelve un
+   * mapa por punto: 1 = semilla admitida, 2 = semilla descartada, 0 = no es semilla.
+   */
+  private admit(seed: Uint8Array, fine: Uint8Array, rgba: Uint8Array, vw: number, vh: number, w: number): Uint8Array {
+    const n = vw * vh;
+    const ok = this.ok!;
+    const stack = this.stack!;
+    ok.fill(0);
+    // 1) casillas "cerca": las que tocan una semilla y sus ocho vecinas
+    const T = Math.max(4, Math.round(vw * OBJECT.NEAR_TILE));
+    const tw = Math.ceil(vw / T);
+    const th = Math.ceil(vh / T);
+    const near = new Uint8Array(tw * th);
+    let any = false;
+    for (let y = 0; y < vh; y++) {
+      for (let x = 0; x < vw; x++) {
+        if (seed[y * vw + x] <= 127) continue;
+        any = true;
+        const tx = (x / T) | 0;
+        const ty = (y / T) | 0;
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const ax = tx + dx;
+            const ay = ty + dy;
+            if (ax >= 0 && ax < tw && ay >= 0 && ay < th) near[ay * tw + ax] = 1;
+          }
+      }
+    }
+    if (!any) return ok;
+    // 2) colores de lo que queda lejos (y no eres tú)
+    const far = this.farBins;
+    far.fill(0);
+    let farTotal = 0;
+    for (let y = 0; y < vh; y++) {
+      for (let x = 0; x < vw; x++) {
+        if (near[((y / T) | 0) * tw + ((x / T) | 0)] || fine[y * 2 * w + x * 2] >= 128) continue;
+        far[colorBin(rgba, y * vw + x)]++;
+        farTotal++;
+      }
+    }
+    const judge = farTotal >= n * OBJECT.FAR_MIN;
+    const limit = farTotal * OBJECT.FAR_SHARE;
+    // 3) por manchas: se admite entera si bastantes de sus puntos tienen un color que lejos no aparece
+    for (let s0 = 0; s0 < n; s0++) {
+      if (seed[s0] <= 127 || ok[s0]) continue;
+      let top = 0;
+      let count = 0;
+      let rare = 0;
+      stack[top++] = s0;
+      ok[s0] = 2;
+      const first = s0;
+      while (top > 0) {
+        const i = stack[--top];
+        count++;
+        if (far[colorBin(rgba, i)] < limit) rare++;
+        const x = i % vw;
+        if (x > 0 && seed[i - 1] > 127 && !ok[i - 1]) {
+          ok[i - 1] = 2;
+          stack[top++] = i - 1;
+        }
+        if (x < vw - 1 && seed[i + 1] > 127 && !ok[i + 1]) {
+          ok[i + 1] = 2;
+          stack[top++] = i + 1;
+        }
+        if (i >= vw && seed[i - vw] > 127 && !ok[i - vw]) {
+          ok[i - vw] = 2;
+          stack[top++] = i - vw;
+        }
+        if (i + vw < n && seed[i + vw] > 127 && !ok[i + vw]) {
+          ok[i + vw] = 2;
+          stack[top++] = i + vw;
+        }
+      }
+      if (!judge || count < OBJECT.BLOB_MIN || rare < count * OBJECT.BLOB_RARE) continue;
+      // admitida: se vuelve a recorrer la mancha marcándola con 1
+      top = 0;
+      stack[top++] = first;
+      ok[first] = 1;
+      while (top > 0) {
+        const i = stack[--top];
+        const x = i % vw;
+        if (x > 0 && ok[i - 1] === 2 && seed[i - 1] > 127) {
+          ok[i - 1] = 1;
+          stack[top++] = i - 1;
+        }
+        if (x < vw - 1 && ok[i + 1] === 2 && seed[i + 1] > 127) {
+          ok[i + 1] = 1;
+          stack[top++] = i + 1;
+        }
+        if (i >= vw && ok[i - vw] === 2 && seed[i - vw] > 127) {
+          ok[i - vw] = 1;
+          stack[top++] = i - vw;
+        }
+        if (i + vw < n && ok[i + vw] === 2 && seed[i + vw] > 127) {
+          ok[i + vw] = 1;
+          stack[top++] = i + vw;
+        }
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * `seed`: semillas (vw×vh, >127 = semilla). `fine`: máscara del modelo fino
+   * a resolución completa (ancho `w`). `rgba`: el cuadro a vw×vh. Devuelve el
+   * mapa del objeto (vw×vh, 0–255); vale hasta la siguiente llamada.
+   */
+  update(seed: Uint8Array, fine: Uint8Array, rgba: Uint8Array, vw: number, vh: number, w: number): Uint8Array {
+    const n = vw * vh;
+    if (this.acc?.length !== n) {
+      this.acc = new Uint8Array(n);
+      this.col = new Uint8Array(n * 3);
+      this.ok = new Uint8Array(n);
+      this.stack = new Int32Array(n);
+    }
+    const acc = this.acc;
+    const col = this.col!;
+    const ok = this.admit(seed, fine, rgba, vw, vh, w);
+    for (let y = 0; y < vh; y++) {
+      for (let x = 0; x < vw; x++) {
+        const i = y * vw + x;
+        if (fine[y * 2 * w + x * 2] >= 128) {
+          acc[i] = 0; // ahí estás tú
+          continue;
+        }
+        const r = rgba[i * 4];
+        const g = rgba[i * 4 + 1];
+        const b = rgba[i * 4 + 2];
+        const had = acc[i];
+        const same = had > 0 && Math.abs(r - col[i * 3]) + Math.abs(g - col[i * 3 + 1]) + Math.abs(b - col[i * 3 + 2]) <= OBJECT.SAME;
+        if (ok[i] === 1) {
+          // sembrado otra vez sobre lo mismo: firme; si no, candidato
+          acc[i] = same ? 255 : OBJECT.CANDIDATE;
+          col[i * 3] = r;
+          col[i * 3 + 1] = g;
+          col[i * 3 + 2] = b;
+        } else if (had > 0) {
+          const next = same ? had * OBJECT.KEEP : 0;
+          // un candidato que no se repite se pierde pronto
+          acc[i] = had <= OBJECT.CANDIDATE && next < OBJECT.CANDIDATE_MIN ? 0 : next;
+        }
+      }
+    }
+    return acc;
+  }
 }
 
 /**

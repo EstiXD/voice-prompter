@@ -79,6 +79,28 @@ describe("PerfGovernor", () => {
     expect(g.memory.model).toBe("lite");
   });
 
+  it("si componer casi no ocupa la gráfica, perder cuadros no baja la calidad", () => {
+    const g = gov(mem());
+    // 30 fps de cámara: 33 ms por cuadro; componer tarda 4 ms
+    const { changes } = feed(g, { ...dropping, gpuMs: 4 }, 30);
+    expect(changes).toEqual([]);
+    expect(g.profile.quality).toBe(2);
+  });
+
+  it("si componer sí pesa y se pierden cuadros, baja", () => {
+    const g = gov(mem());
+    const { changes } = feed(g, () => (g.profile.quality === 2 ? { ...dropping, gpuMs: 22 } : { ...good, gpuMs: 12 }), 30);
+    expect(changes[0]).toMatchObject({ quality: 1 });
+    expect(g.profile.quality).toBe(1);
+  });
+
+  it("una calidad rebajada se devuelve en cuanto se ve que componer es barato, aunque haya tope", () => {
+    const g = gov(mem({ quality: 0, qualityCap: 0, cappedAt: 999_000 }));
+    const { changes } = feed(g, { ...dropping, gpuMs: 3 }, 20);
+    expect(changes.map((c) => c.quality)).toEqual([1, 2]);
+    expect(g.memory).toMatchObject({ quality: 2, qualityCap: 2, cappedAt: 0 });
+  });
+
   it("un recorte lento sin cuadros perdidos no baja la calidad", () => {
     const g = gov(mem());
     const { changes } = feed(g, { fps: 30, cameraFps: 30, segOn: true, segMs: 60 }, 20);

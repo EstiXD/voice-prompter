@@ -78,16 +78,35 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
     caro; solo donde sobra gráfica);
   - si el modelo rápido rinde más en la gráfica o en el procesador (se mide
     un segundo con cada uno la primera vez);
-  - calidad de la composición (muestras del desenfoque, luz de borde, nitidez
-    y limpieza de ruido).
+  - calidad de la composición (cuántas muestras gastan el desenfoque y la luz
+    de borde; el aspecto no cambia). Solo se rebaja si se pierden cuadros Y
+    componer ocupa de verdad la gráfica: se cronometra con
+    `EXT_disjoint_timer_query_webgl2`. En una integrada componer son ~4–9 ms
+    por cuadro, así que casi nunca toca.
 
-  En equipos de gama media con núcleos libres, el modelo fino corre de vez en
-  cuando como "maestro": marca lo que el rápido confunde con persona (la
-  silla de detrás) y la GPU lo veta mientras se siga viendo igual. Lo
-  aprendido se guarda por aparato (`voice-prompter:perf:v1`). Para fijar un
-  perfil a mano: `localStorage.setItem("vp:perf", "multi,2")` (modelo
+  Lo aprendido se guarda por aparato (`voice-prompter:perf:v1`). Para fijar
+  un perfil a mano: `localStorage.setItem("vp:perf", "multi,2")` (modelo
   `lite`/`multi`, calidad `0`–`2`) y recargar. Sin workers u `OffscreenCanvas`
   todo sigue en el hilo principal.
+- **Qué se queda y qué se va**: el umbral es generoso (ante la duda, se
+  queda: así no se recorta una oreja con auricular ni entra y sale la silla),
+  pero lo dudoso que tiene el mismo color que el fondo seguro de al lado
+  —la franja de pared junto a un brazo, lo que se ve entre los dedos— necesita
+  mucha más confianza para quedarse.
+- **Bordes firmes**: donde la imagen no cambió respecto al cuadro anterior, la
+  máscara nueva entra muy poco a poco (el contorno no tiembla estando quieto);
+  donde hay movimiento manda la nueva, sin estela, y sigue mandando un cuarto
+  de segundo después de parar para que termine de asentarse. Donde el modelo
+  duda (confianza cerca de 0,5) la máscara anterior pesa aún más: la idea del
+  suavizado de MediaPipe.
+- **Conservar mi silla (beta, apagado)**: en "Fondo y luz", solo en equipos de
+  escritorio con núcleos de sobra. El modelo fino corre cada 1–3 s en otro
+  worker y, de lo que el rápido reclama sin ser persona, recuerda las manchas
+  cuyo color no aparece lejos de ellas (`ObjectTracker` en `mask.ts`, con
+  tests). Mejora mucho una silla de colores vivos, pero puede quedarse con
+  otro objeto cercano de color único, y cada pasada cuesta medio segundo de
+  un núcleo. Lo que NO funciona, para no repetirlo: usar esas zonas para
+  vetar la silla abre huecos en las manos que pasan por delante.
 - **Alineación** (`src/lib/align/aligner.ts`): alineación de secuencias con
   pesos (programación dinámica) de todo lo dicho contra una ventana del
   guion: las palabras funcionales ("y", "de") casi no pesan, saltarse
@@ -114,6 +133,10 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   y el camino sin WebGL2. Como los puntos de la cara llegan un par de
   cuadros después que la imagen, los ojos se llevan a donde estarán con la
   velocidad de las dos últimas detecciones.
+- **Imagen**: limpieza de ruido en el tiempo (zonas quietas) y en el espacio
+  (vecinos parecidos; quita grano y bloques de la webcam también en
+  movimiento) y nitidez adaptativa al contraste, sin halos. La grabación va a
+  8 Mbps a 720p y 16 a 1080p.
 - **Recorte limpio** (`mask.ts`, con tests): con el modelo fino, persona =
   1 − fondo − objetos lejos de la cabeza; se quitan islas sueltas y se
   rellenan huecos pequeños cerrados. La cara queda siempre sólida y el

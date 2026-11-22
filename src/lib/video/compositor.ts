@@ -21,7 +21,7 @@
 import type { FaceLandmarker, FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
 import { blurPx, imageBlurPx, paintPreset, prepareBackground, type BackgroundChoice } from "./backgrounds";
 import { GlRenderer, PROBE_H, PROBE_W, type ColorStyle, type EyeWarp } from "./gl";
-import { MaskCleaner, maskDrift, solidEllipse, toBytes, vetoMap } from "./mask";
+import { MaskCleaner, maskDrift, ObjectTracker, solidEllipse, toBytes, vetoMap } from "./mask";
 import { PerfGovernor, pickDelegate, sanitizeMemory, type PerfMemory, type PerfProfile, type Quality, type SegDelegate, type SegModel } from "./perf";
 import { VisionLink, type FaceResult, type MaskResult } from "./vision-link";
 import {
@@ -35,7 +35,6 @@ import {
   GazeMeter,
   headPose,
   headTurnFade,
-  irisReach,
   LM,
   movedEye,
   warpEye,
@@ -70,6 +69,11 @@ export type VideoFx = {
   denoise: boolean;
   /** realza ojos, pelo y ropa */
   sharpen: boolean;
+  /**
+   * Experimental: tu silla (o lo que tengas pegado detrás) se reconoce y se
+   * queda contigo fija, en vez de entrar y salir del recorte a trozos.
+   */
+  keepChair: boolean;
   /** estilo de color de toda la imagen */
   style: ColorStyle;
 };
@@ -85,6 +89,7 @@ export const DEFAULT_FX: VideoFx = {
   studioLight: false,
   denoise: true,
   sharpen: true,
+  keepChair: false,
   style: "natural",
 };
 
@@ -104,6 +109,10 @@ export type CompositorStats = {
   quality: Quality;
   /** el recorte corre en su worker (false = hilo principal) */
   worker: boolean;
+  /** lo que tarda la gráfica en componer un cuadro, ms (0 = el navegador no deja medirlo) */
+  gpuMs: number;
+  /** este equipo usa el modelo fino de apoyo (reconoce la silla) */
+  teacher: boolean;
 };
 
 export type GazeState = {
@@ -158,12 +167,17 @@ const FACE_INPUT = 960;
 /** recortes que se miden con cada opción (GPU, CPU) antes de elegir */
 const CALIB_MASKS = 28;
 /**
- * "Maestro": en equipos de gama media el modelo fino no llega a 30 fps, pero
- * sí puede correr de vez en cuando en un núcleo libre. Cada pasada marca qué
- * zonas el modelo rápido confunde con persona (la silla) y la GPU las veta
- * mientras sigan viéndose igual (gl.ts). Quieto, una pasada cada 3 s; si la
- * silueta cambió, antes, pero nunca más de una por segundo: cada pasada son
- * ~0,4 s de un núcleo al 100 %.
+ * "Maestro" (experimental, solo con la opción "Conservar mi silla"): el modelo
+ * fino no llega a 30 fps en un equipo de gama media, pero puede correr de vez
+ * en cuando en un núcleo libre. Cada pasada marca qué reclama el modelo
+ * rápido que no eres tú, y lo que se repite con un color raro en el fondo
+ * (una silla) se recuerda y se deja fijo (ObjectTracker en mask.ts). Quieto,
+ * una pasada cada 3 s; si la silueta cambió, antes, pero nunca más de una por
+ * segundo: cada pasada son ~0,5 s de un núcleo al 100 %.
+ *
+ * Lo que se probó y NO funciona, para no repetirlo: usar esas mismas zonas
+ * para vetar la silla (mandarla al fondo). Abre huecos en las manos que
+ * pasan por delante —piel y silla naranja se parecen— y las deja translúcidas.
  */
 const TEACH_EVERY_MS = 3000;
 const TEACH_MIN_MS = 1000;
@@ -449,6 +463,7 @@ export class VideoCompositor {
   private segMainModel: SegModel | null = null;
   private faceMain: FaceLandmarker | null = null;
   private readonly cleaner = new MaskCleaner();
+  private readonly objects = new ObjectTracker();
   private mainBytes: Uint8Array | null = null;
   /** la máscara más nueva que llegó del worker y aún no se usó */
   private pendingMask: MaskResult | null = null;
@@ -593,6 +608,8 @@ export class VideoCompositor {
       model: this.activeModel(),
       quality: this.profile.quality,
       worker,
+      gpuMs: Math.round((this.gl?.gpuMs ?? 0) * 10) / 10,
+      teacher: this.canTeach && !!this.gl,
     };
   }
 
@@ -651,6 +668,8 @@ export class VideoCompositor {
       this.gl?.resetMask();
       this.mask.ready = false;
       this.pendingMask = null;
+      this.objects.reset();
+      this.teachAt = 0;
     } else {
       if (was === "none") this.governor.settle(performance.now());
       this.ensureSegmenter();
@@ -684,6 +703,14 @@ export class VideoCompositor {
   }
 
   setFx(fx: VideoFx): void {
+    // ajustes guardados antes de existir la opción llegan sin ella: vale el valor por defecto
+    fx = { ...DEFAULT_FX, ...fx };
+    if (fx.keepChair !== this.fx.keepChair) {
+      // lo aprendido de la silla deja de valer
+      this.objects.reset();
+      this.gl?.clearVeto();
+      this.teachAt = 0;
+    }
     this.fx = { ...fx };
     if (fx.light || fx.beauty || fx.eyeContact || fx.gazeMeter || fx.studioLight) this.ensureFace();
   }
@@ -923,7 +950,7 @@ export class VideoCompositor {
         const worker = this.segLink?.state === "ready";
         // en el hilo principal el recorte tarda lo que tarda el cuadro
         const segMs = !segOn ? 0 : worker ? this.segLink!.roundTrip : this.frameMsEma * this.segEvery;
-        const next = this.governor.update({ fps: this.fps, cameraFps: this.cameraFps, segOn, segMs }, t1);
+        const next = this.governor.update({ fps: this.fps, cameraFps: this.cameraFps, segOn, segMs, gpuMs: this.gl?.gpuMs ?? 0 }, t1);
         if (next) this.applyProfile(next);
         else if (this.governor.takeConfirmed()) savePerfMemory(this.governor.memory);
       }
@@ -1082,9 +1109,9 @@ export class VideoCompositor {
     if (this.segLink) this.calibrateDelegate(this.segLink);
   }
 
-  /** El maestro solo acompaña al modelo rápido, con WebGL2 y en la calidad más alta. */
+  /** El maestro solo trabaja si se pidió conservar la silla, con el modelo rápido y con WebGL2. */
   private teacherWanted(): boolean {
-    return this.canTeach && !!this.gl && !this.calib && this.profile.model === "lite" && this.profile.quality === 2 && this.activeModel() === "lite";
+    return this.canTeach && !!this.fx.keepChair && !!this.gl && !this.calib && this.profile.model === "lite" && this.activeModel() === "lite";
   }
 
   /** Le manda al maestro el mismo cuadro que acaba de salir hacia el modelo rápido. */
@@ -1124,7 +1151,7 @@ export class VideoCompositor {
     to.ctx.imageSmoothingQuality = "medium";
     to.ctx.drawImage(this.video, 0, 0, w, h);
     const bmp = to.c.transferToImageBitmap();
-    if (!t.send(this.frame, ts, bmp)) {
+    if (!t.send(this.frame, ts, bmp, true)) {
       bmp.close();
       return;
     }
@@ -1140,12 +1167,16 @@ export class VideoCompositor {
     if (!this.teacherWanted() || this.bg.kind === "none") return;
     const vw = fine.w >> 1;
     const vh = fine.h >> 1;
-    if (this.vetoBuf?.length !== vw * vh) {
-      this.vetoBuf = new Uint8Array(vw * vh);
-      this.vetoTmp = new Uint8Array(vw * vh);
+    const n = vw * vh;
+    if (!fine.pixels || fine.pixels.length !== n * 4) return;
+    if (this.vetoBuf?.length !== n) {
+      this.vetoBuf = new Uint8Array(n);
+      this.vetoTmp = new Uint8Array(n);
     }
-    vetoMap(fast, fine.data, fine.w, fine.h, this.vetoBuf, this.vetoTmp!);
-    this.gl.setVeto(this.vetoBuf, vw, vh);
+    // lo que el modelo rápido reclama y el fino no: trozos de silla (y, alrededor de una mano, pared)
+    vetoMap(fast, fine.data, fine.w, fine.h, this.vetoBuf, this.vetoTmp!, 1);
+    // de ahí, lo que se repite con un color raro en el fondo se queda contigo
+    this.gl.setTeach(this.objects.update(this.vetoBuf, fine.data, fine.pixels, vw, vh, fine.w), vw, vh);
   }
 
   /** Pasa a la GPU (o al camino 2D) la máscara que llegó del worker, si hay una nueva. */
@@ -1453,7 +1484,7 @@ export class VideoCompositor {
       wb: light ? this.wb : [1, 1, 1],
       wrap: 0.6,
       denoise: this.fx.denoise ? 1 : 0,
-      sharpen: this.fx.sharpen ? 0.55 : 0,
+      sharpen: this.fx.sharpen ? 0.7 : 0,
       key: this.keyLight(),
       style: this.fx.style ?? "natural",
       quality: this.profile.quality,
@@ -1463,11 +1494,11 @@ export class VideoCompositor {
         cos: Math.cos(e.angle),
         sin: Math.sin(e.angle),
         ax: e.width / 2,
-        ay: Math.max(1, e.open / 2),
+        above: e.above,
+        below: e.below,
         irisX: e.iris.x,
         irisY: e.iris.y,
         irisR: e.irisR,
-        reach: irisReach(e),
         shiftX: shift.x,
         shiftY: shift.y,
       })),

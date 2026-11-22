@@ -41,6 +41,12 @@ export type PerfSample = {
   segOn: boolean;
   /** ida y vuelta de un recorte en ms (media móvil); 0 = sin datos */
   segMs: number;
+  /**
+   * Lo que tarda la gráfica en componer un cuadro, ms (0 o sin dato = el
+   * navegador no deja medirlo). Es la única perilla que la calidad mueve: si
+   * la composición apenas ocupa la gráfica, bajarla no devuelve ni un cuadro.
+   */
+  gpuMs?: number;
 };
 
 export type PerfOptions = {
@@ -109,6 +115,14 @@ export function pickDelegate(gpuMs: number, cpuMs: number, frameMs: number): Seg
 type Trial = { kind: "quality" | "model"; until: number; back: PerfProfile };
 /** una bajada en observación: ¿sirvió de algo? */
 type Relief = { back: PerfProfile; capBefore: Quality; cappedAtBefore: number; before: number; sum: number; n: number };
+
+/**
+ * Fracción del tiempo de un cuadro que ocupa componerlo en la gráfica: por
+ * encima de GPU_HEAVY bajar la calidad puede devolver cuadros; por debajo de
+ * GPU_LIGHT se sube sin más (el escalón siguiente cuesta, como mucho, el doble).
+ */
+const GPU_HEAVY = 0.4;
+const GPU_LIGHT = 0.2;
 
 /** muestras con las que se juzga si una bajada sirvió */
 const RELIEF_SAMPLES = 3;
@@ -201,6 +215,21 @@ export class PerfGovernor {
     const slowSeg = s.segOn && s.segMs > 0 && s.segMs > frameMs * 1.25;
     const isBad = dropping || slowSeg;
     const isGood = s.fps >= s.cameraFps * 0.95 && (!s.segOn || s.segMs === 0 || s.segMs < frameMs * 0.75);
+    const gpuKnown = (s.gpuMs ?? 0) > 0;
+    // la composición pesa de verdad (o no se sabe): bajar su calidad puede servir
+    const gpuHeavy = !gpuKnown || s.gpuMs! > frameMs * GPU_HEAVY;
+
+    // Se sabe que componer casi no ocupa la gráfica: una calidad rebajada es
+    // imagen perdida a cambio de nada (el freno, si lo hay, es otro). Se
+    // devuelve sin esperar ni probar, aunque haya un tope anotado.
+    if (gpuKnown && s.gpuMs! < frameMs * GPU_LIGHT && this.mem.quality < 2 && !this.trial && !this.relief) {
+      this.mem.qualityCap = 2;
+      this.mem.cappedAt = 0;
+      this.bad = 0;
+      this.good = 0;
+      this.confirmed = true;
+      return this.apply({ model: this.mem.model, quality: (this.mem.quality + 1) as Quality }, now);
+    }
 
     if (isBad) {
       this.good = 0;
@@ -256,7 +285,7 @@ export class PerfGovernor {
       }
       // solo se baja por cuadros perdidos (un recorte lento no lo arregla
       // la composición) y mientras bajar haya servido de algo
-      if (this.mem.quality > 0 && dropping && !this.futile) {
+      if (this.mem.quality > 0 && dropping && gpuHeavy && !this.futile) {
         const back = this.profile;
         const q = (this.mem.quality - 1) as Quality;
         this.relief = { back, capBefore: this.mem.qualityCap, cappedAtBefore: this.mem.cappedAt, before: s.fps / s.cameraFps, sum: 0, n: 0 };

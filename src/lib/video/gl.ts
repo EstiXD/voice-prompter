@@ -17,6 +17,8 @@
 // Convención de coordenadas: todas las texturas se suben sin voltear (fila 0 =
 // arriba = v 0); solo el último pase, que pinta en pantalla, invierte v.
 
+import { EYE_SHAPE } from "./face";
+
 const VS = `#version 300 es
 in vec2 aPos;
 uniform bool uFlip;
@@ -35,6 +37,34 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 `;
 
 /**
+ * Lo que enseña el modelo fino (ver "maestro" en compositor.ts): el mapa del
+ * objeto pegado a ti (tu silla) y el cuadro con el que se calculó, para
+ * comprobar que cada punto sigue viéndose igual.
+ */
+const TEACH_GLSL = `
+uniform sampler2D uVeto;
+uniform sampler2D uRef;
+uniform vec2 uRefOff;
+uniform float uVetoOn;
+
+/**
+ * ¿Este punto se ve como cuando lo miró el modelo fino? 1 = igual; 0 = cambió
+ * (te moviste encima, pasaste una mano por delante). Se compara con la
+ * referencia en el punto y en sus vecinos: una silla que se mece unos píxeles
+ * contigo sigue siendo la misma silla.
+ */
+float sameAsRef(vec3 cur, vec2 uv) {
+  vec2 t = uRefOff * 4.0; // un píxel de la referencia
+  float d = length(cur - texture(uRef, uv).rgb);
+  d = min(d, length(cur - texture(uRef, uv + vec2(t.x, 0.0)).rgb));
+  d = min(d, length(cur - texture(uRef, uv - vec2(t.x, 0.0)).rgb));
+  d = min(d, length(cur - texture(uRef, uv + vec2(0.0, t.y)).rgb));
+  d = min(d, length(cur - texture(uRef, uv - vec2(0.0, t.y)).rgb));
+  return 1.0 - smoothstep(0.13, 0.30, d);
+}
+`;
+
+/**
  * Filtro guiado, paso 1: a baja resolución, (I, p, I·p, I·I) con I = luma del
  * cuadro (centrada en 0: menos error al restar en media precisión) y p = la
  * máscara del modelo.
@@ -43,12 +73,24 @@ const FS_GF_PREP = `${HEAD}
 uniform sampler2D uVideo;
 uniform sampler2D uMask;
 uniform vec2 uOff;
+${TEACH_GLSL}
 void main() {
   // 4 muestras bilineales: promedio decente del cuadro al reducirlo
   vec3 c = 0.25 * (texture(uVideo, vUv + uOff * vec2(-1.0, -1.0)).rgb + texture(uVideo, vUv + uOff * vec2(1.0, -1.0)).rgb
                  + texture(uVideo, vUv + uOff * vec2(-1.0, 1.0)).rgb + texture(uVideo, vUv + uOff).rgb);
   float I = luma(c) - 0.5;
   float p = texture(uMask, vUv).r;
+  // Lo que el modelo fino reconoció como pegado a ti (tu silla) cuenta como
+  // tuyo mientras se siga viendo igual. Entra AQUÍ, antes del filtro guiado,
+  // para que su borde se ajuste a la imagen como el tuyo. Si pasas una mano
+  // por delante, ese punto cambia de color y vuelve a decidir el modelo
+  // rápido: mano y silla nunca se pelean.
+  if (uVetoOn > 0.0) {
+    // entero mientras el recuerdo sea firme; al aflojarse (lleva muchas
+    // pasadas sin que nadie lo reclame) se va de una vez, no a medias
+    float obj = smoothstep(0.25, 0.4, texture(uVeto, vUv).r);
+    if (obj > 0.02) p = max(p, obj * sameAsRef(c, vUv) * uVetoOn);
+  }
   o = vec4(I, p, I * p, I * I);
 }`;
 
@@ -75,45 +117,47 @@ void main() {
   o = vec4(a, m.g - a * m.r, m.g, 1.0);
 }`;
 
-const VETO = `
-  // Veto del modelo fino: donde él dijo "esto no es persona" (la silla) y el
-  // píxel sigue viéndose como entonces, es fondo aunque el modelo rápido
-  // insista. Si el color cambió es que te moviste encima: decide el rápido.
-  // Se compara con la referencia en el píxel y en sus vecinos: una silla que
-  // se mece unos píxeles contigo sigue siendo la misma silla.
-  if (uVetoOn > 0.0) {
-    float v = texture(uVeto, vUv).r;
-    if (v > 0.02) {
-      vec3 cur = 0.25 * (texture(uVideo, vUv + uRefOff * vec2(-1.0, -1.0)).rgb + texture(uVideo, vUv + uRefOff * vec2(1.0, -1.0)).rgb
-                       + texture(uVideo, vUv + uRefOff * vec2(-1.0, 1.0)).rgb + texture(uVideo, vUv + uRefOff).rgb);
-      vec2 t = uRefOff * 4.0; // un píxel de la referencia
-      float d = length(cur - texture(uRef, vUv).rgb);
-      d = min(d, length(cur - texture(uRef, vUv + vec2(t.x, 0.0)).rgb));
-      d = min(d, length(cur - texture(uRef, vUv - vec2(t.x, 0.0)).rgb));
-      d = min(d, length(cur - texture(uRef, vUv + vec2(0.0, t.y)).rgb));
-      d = min(d, length(cur - texture(uRef, vUv - vec2(0.0, t.y)).rgb));
-      float same = 1.0 - smoothstep(0.13, 0.30, d);
-      m *= 1.0 - min(1.0, v * 1.3) * same * uVetoOn;
-    }
-  }
-`;
-
-const VETO_UNIFORMS = `
-uniform sampler2D uVeto;
-uniform sampler2D uRef;
-uniform vec2 uRefOff;
-uniform float uVetoOn;
-`;
-
 const TEMPORAL = `
-  // suavizado temporal que se adapta al movimiento: quieto, estable (sin
-  // temblor del borde); moviéndote, la máscara nueva manda (sin estela)
+  // Suavizado temporal en tres partes (antes de esto cada sombreador deja en
+  // "live" cuánto movimiento reciente hay en el punto, 0–1):
+  //  · con movimiento, donde el modelo está seguro manda la máscara nueva: no
+  //    deja estela;
+  //  · QUIETO, el borde no salta: la imagen no cambió, así que si la máscara
+  //    nueva dice otra cosa es ruido del modelo o del sensor, y entra muy
+  //    poco a poco. Es lo que deja el contorno firme cuando no te mueves;
+  //  · donde el modelo DUDA (confianza cerca de 0,5: el respaldo de la silla)
+  //    cambia de opinión de un cuadro a otro; ahí la máscara anterior pesa
+  //    mucho más. Es la idea del suavizado de MediaPipe
+  //    (segmentation_smoothing_calculator), ponderado por incertidumbre.
   if (uHasPrev) {
     float prev = texture(uPrev, vUv).r;
     float wNew = mix(uTemporal * 0.55, 0.9, smoothstep(0.08, 0.3, abs(m - prev)));
-    m = mix(prev, m, wNew);
+    wNew = mix(min(wNew, 0.14), wNew, live);
+    float sure = abs(2.0 * texture(uRaw, vUv).r - 1.0);
+    float doubt = 1.0 - smoothstep(0.45, 0.85, sure);
+    m = mix(prev, m, mix(wNew, 0.06, doubt));
   }
-  o = vec4(m, m, m, 1.0);`;
+  // G guarda el movimiento reciente para el cuadro siguiente; R y B, la máscara
+  o = vec4(m, live, m, 1.0);`;
+
+/**
+ * Color del FONDO SEGURO, a baja resolución: el cuadro pesado por "aquí el
+ * modelo está seguro de que no eres tú". Difuminado después con una caja
+ * ancha, da para cada punto el color del fondo de verdad que tiene cerca.
+ * Sale premultiplicado: rgb·peso, peso.
+ */
+const FS_BG_NEAR = `${HEAD}
+uniform sampler2D uVideo;
+uniform sampler2D uMask;
+uniform vec2 uOff;
+void main() {
+  vec3 c = 0.25 * (texture(uVideo, vUv + uOff * vec2(-1.0, -1.0)).rgb + texture(uVideo, vUv + uOff * vec2(1.0, -1.0)).rgb
+                 + texture(uVideo, vUv + uOff * vec2(-1.0, 1.0)).rgb + texture(uVideo, vUv + uOff).rgb);
+  // solo cuenta lo que el modelo da por fondo sin dudar: una zona dudosa
+  // (silla, franja de pared) no opina sobre de qué color es el fondo
+  float w = smoothstep(0.7, 0.95, 1.0 - texture(uMask, vUv).r);
+  o = vec4(c * w, w);
+}`;
 
 /**
  * Filtro guiado, paso 3: a media resolución, q = ā·I + b̄ con el cuadro fino.
@@ -124,18 +168,76 @@ const FS_REFINE_GF = `${HEAD}
 uniform sampler2D uVideo;
 uniform sampler2D uAB;
 uniform sampler2D uPrev;
+uniform sampler2D uRaw;     // la máscara del modelo tal cual (su confianza)
+uniform sampler2D uBgNear;  // color del fondo seguro de al lado (premultiplicado)
+uniform vec4 uBgTune;       // parecido: de (x) a (y) · tope de confianza (z) · umbral (w)
+uniform sampler2D uPrevFrame; // el cuadro anterior (limpio)
+uniform bool uHasPrevFrame;
+uniform vec2 uPx;           // tamaño de un píxel del cuadro
 uniform bool uHasPrev;
 uniform float uTemporal;
 uniform vec2 uEdge;
-${VETO_UNIFORMS}
 void main() {
-  float I = luma(texture(uVideo, vUv).rgb) - 0.5;
+  vec3 c = texture(uVideo, vUv).rgb;
+  float I = luma(c) - 0.5;
   vec4 ab = texture(uAB, vUv);
   float q = ab.r * I + ab.g;
   float mp = ab.b;
   q = clamp(q, smoothstep(0.78, 0.97, mp), smoothstep(0.03, 0.22, mp));
-  float m = smoothstep(uEdge.x, uEdge.y, q);
-${VETO}
+
+  // ¿Cambió la imagen aquí? Se compara con el cuadro anterior en el punto y a
+  // los lados (un solo píxel es demasiado ruidoso). El movimiento se recuerda
+  // un cuarto de segundo: al parar, la máscara todavía tiene que terminar de
+  // llegar a su sitio antes de quedarse fija.
+  vec2 e = uPx * 2.5;
+  vec3 c1 = texture(uVideo, vUv + e).rgb;
+  vec3 c2 = texture(uVideo, vUv - e).rgb;
+  float live = 1.0;
+  if (uHasPrevFrame) {
+    vec3 d0 = abs(c - texture(uPrevFrame, vUv).rgb);
+    vec3 d1 = abs(c1 - texture(uPrevFrame, vUv + e).rgb);
+    vec3 d2 = abs(c2 - texture(uPrevFrame, vUv - e).rgb);
+    float moved = smoothstep(0.012, 0.045, (d0.r + d0.g + d0.b + d1.r + d1.g + d1.b + d2.r + d2.g + d2.b) / 9.0);
+    live = uHasPrev ? max(moved, texture(uPrev, vUv).g - 0.12) : 1.0;
+  }
+
+  // El umbral es generoso (ante la duda, se queda: así no se recorta una
+  // oreja ni entra y sale la silla). Pero no todo lo dudoso es tuyo: la
+  // franja de pared pegada a un brazo, lo que se ve entre los dedos o el
+  // sitio donde tu mano estaba hace un cuadro tienen EL MISMO COLOR que el
+  // fondo seguro de al lado; la silla, la oreja y la ropa, no.
+  // "dist" es cuánto se distingue este punto de ese fondo. Se usa de dos
+  // maneras. En la franja, con el punto tal cual: promediarlo con sus vecinos
+  // mete pared en algo tan delgado como un dedo y le afina la punta. Para el
+  // movimiento, promediado: ahí se busca fondo puro y el grano de un solo
+  // píxel estorba.
+  float dist = 1.0;
+  float distAvg = 1.0;
+  float has = 0.0;
+  vec4 bgc = texture(uBgNear, vUv);
+  if (bgc.a > 0.04) {
+    vec3 bg = bgc.rgb / bgc.a;
+    dist = length(c - bg);
+    distAvg = length((c + c1 + c2) / 3.0 - bg);
+    has = smoothstep(0.04, 0.15, bgc.a);
+  }
+  //  · en la FRANJA DEL BORDE (bien adentro de ti no se toca aunque tu camisa
+  //    sea del color de la pared): lo que se parece al fondo necesita mucha
+  //    más confianza para quedarse, y la opacidad no pasa de lo distinto que
+  //    es: un borde desenfocado (mitad piel, mitad pared) queda a medias y no
+  //    deja halo del color de la pared;
+  float band = has * (1.0 - smoothstep(0.86, 0.98, mp));
+  //  · donde hay MOVIMIENTO, también adentro: la máscara puede llevar un
+  //    cuadro de retraso y decir "persona" donde ya no estás. Pero aquí solo
+  //    se descarta lo que es fondo PURO. Una mano que se mueve rápido sale
+  //    desenfocada, mezclada con la pared: con el criterio de la franja se la
+  //    comía a mordiscos.
+  float pure = has * live * 0.9 * (1.0 - smoothstep(0.05, 0.11, distAvg));
+  float bgLike = max((1.0 - smoothstep(uBgTune.x, uBgTune.y, dist)) * band, pure);
+  q = min(q, mix(1.0, uBgTune.z, bgLike));
+  float lo = mix(uEdge.x, uBgTune.w, bgLike);
+  float m = smoothstep(lo, lo + (uEdge.y - uEdge.x), q);
+  m = min(m, mix(1.0, smoothstep(uBgTune.x - 0.01, uBgTune.y, dist), band));
 ${TEMPORAL}
 }`;
 
@@ -149,7 +251,7 @@ uniform bool uHasPrev;
 uniform float uTemporal;
 uniform vec2 uEdge;
 uniform int uR;
-${VETO_UNIFORMS}
+#define uRaw uMask
 void main() {
   vec3 c = texture(uVideo, vUv).rgb;
   float sum = 0.0;
@@ -164,7 +266,7 @@ void main() {
     }
   }
   float m = smoothstep(uEdge.x, uEdge.y, sum / max(wsum, 1e-4));
-${VETO}
+  float live = 1.0;
 ${TEMPORAL}
 }`;
 
@@ -245,8 +347,24 @@ uniform sampler2D uVideo;
 uniform sampler2D uPrev;
 uniform bool uHasPrev;
 uniform float uStrength;
+uniform vec2 uTexel;
 void main() {
   vec3 cur = texture(uVideo, vUv).rgb;
+  // En el espacio: cada píxel se promedia con los vecinos que se le parecen
+  // (los que difieren más que el ruido —un borde, una pestaña— no entran).
+  // Quita el grano y los bloques de compresión de la webcam también donde hay
+  // movimiento, que es donde el promedio en el tiempo no puede ayudar.
+  vec3 acc = cur;
+  float wsum = 1.0;
+  for (int i = 0; i < 4; i++) {
+    vec2 d = i == 0 ? vec2(uTexel.x, 0.0) : i == 1 ? vec2(-uTexel.x, 0.0) : i == 2 ? vec2(0.0, uTexel.y) : vec2(0.0, -uTexel.y);
+    vec3 n = texture(uVideo, vUv + d).rgb;
+    vec3 e = n - cur;
+    float w = exp(-dot(e, e) * 420.0);
+    acc += n * w;
+    wsum += w;
+  }
+  cur = mix(cur, acc / wsum, 0.45 * uStrength);
   if (!uHasPrev) { o = vec4(cur, 1.0); return; }
   vec3 prev = texture(uPrev, vUv).rgb;
   float d = length(cur - prev);
@@ -302,8 +420,9 @@ uniform vec3 uHighTint;
 uniform int uEyes;
 uniform vec2 uSize;
 uniform vec4 uEyeA[2];      // centro (xy), coseno y seno del eje del ojo
-uniform vec4 uEyeB[2];      // semiejes (x a lo largo, y de apertura), radio del iris, alcance
+uniform vec4 uEyeB[2];      // semieje a lo largo, apertura por encima de las comisuras, radio del iris, apertura por debajo
 uniform vec4 uEyeC[2];      // centro del iris (xy), desplazamiento (zw)
+uniform vec2 uIrisPast;     // cuánto más allá del párpado (arriba, abajo) sigue moviéndose el iris
 
 float s01(float t) { t = clamp(t, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
 
@@ -324,23 +443,31 @@ vec2 eyeWarp(vec2 uv) {
     if (abs(d.x) > ax * 1.8 || abs(d.y) > ax * 1.8) continue;
     float cs = uEyeA[i].z;
     float sn = uEyeA[i].w;
-    float ay = uEyeB[i].y;
     vec2 shift = uEyeC[i].zw;
     float u = (d.x * cs + d.y * sn) / ax;
     float vr = -d.x * sn + d.y * cs;
-    float ell = sqrt(u * u + (vr / ay) * (vr / ay));
+    // dos medias elipses: el ojo abre más por arriba de las comisuras que por abajo
+    bool upper = vr * (cs >= 0.0 ? 1.0 : -1.0) < 0.0;
+    float above = uEyeB[i].y;
+    float below = uEyeB[i].w;
+    float open = above + below;
+    float ay = max(1.0, upper ? above : below);
+    float ell = length(vec2(u, vr / ay));
+    // el iris sigue entero un poco más allá del párpado medido (si no, sale "mordido")
+    float ellIris = length(vec2(u, vr / (ay + open * (upper ? uIrisPast.x : uIrisPast.y))));
     vec2 w = vec2(0.0);
-    if (ell < 1.0) {
+    if (ellIris < 1.0) {
       float irisR = uEyeB[i].z;
+      float reach = max(irisR * 1.6, ax * 0.44);
       float edge = 1.0 - s01((ell - 0.78) / 0.22);
+      float edgeIris = 1.0 - s01((ellIris - 0.85) / 0.15);
       float di = length(p - uEyeC[i].xy - shift);
-      float core = 1.0 - s01((di - irisR * 1.15) / max(1.0, uEyeB[i].w - irisR * 1.15));
-      w = vec2(edge * max(0.3, core));
-    } else if (shift.y != 0.0) {
-      bool upper = vr * (cs >= 0.0 ? 1.0 : -1.0) < 0.0;
-      float k = ay * (upper ? 2.1 : 1.7);
-      float ext = sqrt(u * u + (vr / k) * (vr / k));
-      if (ext < 1.0) w = vec2(0.0, (1.0 - s01((ext - 0.45) / 0.55)) * (upper ? 0.62 : 0.25));
+      float core = 1.0 - s01((di - irisR * 1.15) / max(1.0, reach - irisR * 1.15));
+      w = vec2(max(core * edgeIris, 0.3 * edge));
+    }
+    if (ell >= 1.0 && shift.y != 0.0) {
+      float ext = length(vec2(u, vr / (ay + open * (upper ? 0.55 : 0.35))));
+      if (ext < 1.0) w.y = max(w.y, (1.0 - s01((ext - 0.45) / 0.55)) * (upper ? 0.62 : 0.25));
     }
     p -= shift * w;
   }
@@ -379,12 +506,20 @@ void main() {
   // reflejo hecho trizas; moviéndose con el iris queda entero.
   vec2 uvp = uEyes > 0 ? eyeWarp(vUv) : vUv;
   vec3 raw = texture(uVideo, uvp).rgb;
-  // nitidez (máscara de enfoque): realza detalle de ojos, pelo y ropa
+  // Nitidez adaptativa al contraste (la idea de FidelityFX CAS): cada píxel
+  // se realza según cuánto margen le queda antes de saturar entre sus vecinos.
+  // Da detalle a ojos, pelo y ropa sin los halos blancos de una máscara de
+  // enfoque ni inflar el grano de las zonas lisas.
   if (uSharpen > 0.0) {
-    vec2 d = uTexel * 1.25;
-    vec3 n = texture(uVideo, uvp + vec2(d.x, 0.0)).rgb + texture(uVideo, uvp - vec2(d.x, 0.0)).rgb
-           + texture(uVideo, uvp + vec2(0.0, d.y)).rgb + texture(uVideo, uvp - vec2(0.0, d.y)).rgb;
-    raw = clamp(raw + (raw - n * 0.25) * uSharpen, 0.0, 1.0);
+    vec3 a = texture(uVideo, uvp - vec2(0.0, uTexel.y)).rgb;
+    vec3 b = texture(uVideo, uvp - vec2(uTexel.x, 0.0)).rgb;
+    vec3 d = texture(uVideo, uvp + vec2(uTexel.x, 0.0)).rgb;
+    vec3 e = texture(uVideo, uvp + vec2(0.0, uTexel.y)).rgb;
+    vec3 mn = min(raw, min(min(a, b), min(d, e)));
+    vec3 mx = max(raw, max(max(a, b), max(d, e)));
+    vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-3)), 0.0, 1.0));
+    vec3 w = amp * (-1.0 / mix(8.0, 5.0, uSharpen));
+    raw = clamp((raw + (a + b + d + e) * w) / (1.0 + 4.0 * w), 0.0, 1.0);
   }
   vec3 person = adjust(raw);
 
@@ -456,10 +591,34 @@ export const STYLE_PARAMS: Record<ColorStyle, { temp: number; sat: number; contr
 export const EDGE_TUNE = {
   /** regularización del filtro guiado: más bajo = el borde sigue más al cuadro */
   eps: 0.0012,
-  /** de qué confianza a cuál se pasa de fondo a persona */
-  lo: 0.42,
-  hi: 0.78,
+  /**
+   * De qué confianza a cuál se pasa de fondo a persona. A propósito bajo y
+   * estrecho: ante la duda, se queda, y se queda entero.
+   *  · Bajo: con 0,42–0,78 una oreja con auricular (el modelo le da ~0,5)
+   *    salía recortada y la silla entraba y salía a trozos.
+   *  · Estrecho: a una silla el modelo le da 0,3–0,7 por zonas; con un tramo
+   *    ancho (0,25–0,6) eso se traducía en una silla medio transparente.
+   * El borde nítido de la persona apenas se mueve: ahí el modelo pasa de 0 a 1
+   * en un par de píxeles.
+   */
+  lo: 0.15,
+  hi: 0.35,
+  /**
+   * "Se parece al fondo de al lado": distancia de color (0–1,7) por debajo de
+   * bgNear es el mismo color; por encima de bgFar, otro. Una pared con su
+   * grano y su sombra varía ~0,05; piel o camisa blanca contra una cortina
+   * crema se llevan ~0,24.
+   */
+  bgNear: 0.07,
+  bgFar: 0.17,
+  /** lo que se parece al fondo: tope de confianza y umbral que debe superar (con ese tope, no lo supera) */
+  bgCap: 0.5,
+  bgLo: 0.55,
 };
+
+// EXT_disjoint_timer_query_webgl2
+const TIME_ELAPSED_EXT = 0x88bf;
+const GPU_DISJOINT_EXT = 0x8fbb;
 
 /** Cuadro de referencia del veto (ver `snapshotRef`). */
 const REF_W = 256;
@@ -481,14 +640,14 @@ export type EyeWarp = {
   cy: number;
   cos: number;
   sin: number;
-  /** semieje a lo largo del ojo y semieje de apertura */
+  /** semieje a lo largo del ojo */
   ax: number;
-  ay: number;
+  /** apertura por encima y por debajo de la línea de las comisuras */
+  above: number;
+  below: number;
   irisX: number;
   irisY: number;
   irisR: number;
-  /** hasta dónde llega la zona que acompaña al iris */
-  reach: number;
   shiftX: number;
   shiftY: number;
 };
@@ -520,7 +679,7 @@ export type GlRenderOptions = {
   eyes?: readonly EyeWarp[];
 };
 
-type ProgName = "gfPrep" | "box" | "gfAB" | "refineGf" | "refine" | "bgprep" | "blur" | "composite" | "denoise" | "bokeh" | "probe" | "copy";
+type ProgName = "gfPrep" | "box" | "gfAB" | "bgNear" | "refineGf" | "refine" | "bgprep" | "blur" | "composite" | "denoise" | "bokeh" | "probe" | "copy";
 
 export class GlRenderer {
   readonly canvas: HTMLCanvasElement;
@@ -529,6 +688,8 @@ export class GlRenderer {
   private clean: [Target, Target];
   private cleanCur = 0;
   private hasClean = false;
+  /** clean[1 − cleanCur] guarda el cuadro anterior a este */
+  private prevFrameOk = false;
   private readonly vao: WebGLVertexArrayObject;
   private readonly video: WebGLTexture;
   private readonly mask: WebGLTexture;
@@ -541,6 +702,8 @@ export class GlRenderer {
   private blurB: Target;
   /** filtro guiado: dos destinos flotantes a baja resolución (null = sin soporte) */
   private gf: [Target, Target] | null = null;
+  /** color del fondo seguro de al lado, a la resolución del filtro guiado (y su temporal para difuminar) */
+  private bgNear: [Target, Target] | null = null;
   private readonly floatTargets: boolean;
   private maskSize = { w: 0, h: 0 };
   private maskDirty = false;
@@ -557,6 +720,11 @@ export class GlRenderer {
   private readonly eyeA = new Float32Array(8);
   private readonly eyeB = new Float32Array(8);
   private readonly eyeC = new Float32Array(8);
+  private readonly timerOk: boolean;
+  private timerQuery: WebGLQuery | null = null;
+  private timerTick = 0;
+  /** lo que tarda la gráfica en componer un cuadro, ms (media móvil); 0 = sin medir */
+  gpuMs = 0;
   // veto del modelo fino: mapa + el cuadro con el que se calculó
   private readonly veto: WebGLTexture;
   private readonly ref: [Target, Target];
@@ -585,11 +753,13 @@ export class GlRenderer {
     this.gl = gl;
     // texturas flotantes como destino: desenfoque premultiplicado sin bandas y filtro guiado
     this.floatTargets = !!gl.getExtension("EXT_color_buffer_float") || !!gl.getExtension("EXT_color_buffer_half_float");
+    this.timerOk = !!gl.getExtension("EXT_disjoint_timer_query_webgl2");
 
     this.progs = {
       gfPrep: this.program(FS_GF_PREP),
       box: this.program(FS_BOX),
       gfAB: this.program(FS_GF_AB),
+      bgNear: this.program(FS_BG_NEAR),
       refineGf: this.program(FS_REFINE_GF),
       refine: this.program(FS_REFINE),
       bgprep: this.program(FS_BGPREP),
@@ -623,7 +793,10 @@ export class GlRenderer {
     this.clean = [this.target(1, 1, gl.RGBA8), this.target(1, 1, gl.RGBA8)];
     this.blurA = this.target(1, 1, rgbaFmt);
     this.blurB = this.target(1, 1, rgbaFmt);
-    if (this.floatTargets) this.gf = [this.target(1, 1, gl.RGBA16F), this.target(1, 1, gl.RGBA16F)];
+    if (this.floatTargets) {
+      this.gf = [this.target(1, 1, gl.RGBA16F), this.target(1, 1, gl.RGBA16F)];
+      this.bgNear = [this.target(1, 1, gl.RGBA16F), this.target(1, 1, gl.RGBA16F)];
+    }
     this.probe = this.target(PROBE_W, PROBE_H, gl.RGBA8);
     this.veto = this.texture(true);
     this.ref = [this.target(REF_W, REF_H, gl.RGBA8), this.target(REF_W, REF_H, gl.RGBA8)];
@@ -719,10 +892,12 @@ export class GlRenderer {
       const gw = Math.max(2, Math.min(384, Math.round(w / 4)));
       const gh = Math.max(2, Math.round((gw * h) / Math.max(1, w)));
       this.gf = [this.retarget(this.gf[0], gw, gh, gl.RGBA16F), this.retarget(this.gf[1], gw, gh, gl.RGBA16F)];
+      if (this.bgNear) this.bgNear = [this.retarget(this.bgNear[0], gw, gh, gl.RGBA16F), this.retarget(this.bgNear[1], gw, gh, gl.RGBA16F)];
     }
     this.clean = [this.retarget(this.clean[0], w, h, gl.RGBA8), this.retarget(this.clean[1], w, h, gl.RGBA8)];
     this.hasPrev = false;
     this.hasClean = false;
+    this.prevFrameOk = false;
     this.hasFrame = false;
   }
 
@@ -787,8 +962,8 @@ export class GlRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  /** Mapa de veto (0–255) calculado sobre el cuadro de la última `snapshotRef`. */
-  setVeto(data: Uint8Array, w: number, h: number): void {
+  /** Mapa del objeto pegado a ti (0–255) que el modelo fino calculó sobre el cuadro de la última `snapshotRef`. */
+  setTeach(data: Uint8Array, w: number, h: number): void {
     const gl = this.gl;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.veto);
@@ -879,6 +1054,7 @@ export class GlRenderer {
       this.bindTex(1, this.mask, prep.u.uMask);
       const s = this.W / ga.w / 4;
       gl.uniform2f(prep.u.uOff ?? null, s / this.W, s / this.H);
+      this.bindVeto(prep);
       this.draw(ga, prep);
       this.boxBlur(ga, gb, r);
       const ab = this.progs.gfAB;
@@ -887,15 +1063,31 @@ export class GlRenderer {
       gl.uniform1f(ab.u.uEps ?? null, EDGE_TUNE.eps);
       this.draw(gb, ab);
       this.boxBlur(gb, ga, r);
+      // color del fondo seguro de al lado: caja ancha (~1/16 del ancho a cada lado), dos veces
+      const [na, nb] = this.bgNear!;
+      const bn = this.progs.bgNear;
+      gl.useProgram(bn.p);
+      this.bindTex(0, src, bn.u.uVideo);
+      this.bindTex(1, this.mask, bn.u.uMask);
+      gl.uniform2f(bn.u.uOff ?? null, s / this.W, s / this.H);
+      this.draw(na, bn);
+      const wide = Math.max(4, Math.round(na.w / 32));
+      this.boxBlur(na, nb, wide);
+      this.boxBlur(na, nb, wide);
       const pr = this.progs.refineGf;
       gl.useProgram(pr.p);
       this.bindTex(0, src, pr.u.uVideo);
       this.bindTex(1, gb.tex, pr.u.uAB);
       this.bindTex(2, prev.tex, pr.u.uPrev);
+      this.bindTex(4, na.tex, pr.u.uBgNear);
+      gl.uniform4f(pr.u.uBgTune ?? null, EDGE_TUNE.bgNear, EDGE_TUNE.bgFar, EDGE_TUNE.bgCap, EDGE_TUNE.bgLo);
+      this.bindTex(5, this.clean[1 - this.cleanCur].tex, pr.u.uPrevFrame);
+      gl.uniform1i(pr.u.uHasPrevFrame ?? null, this.prevFrameOk ? 1 : 0);
+      gl.uniform2f(pr.u.uPx ?? null, 1 / this.W, 1 / this.H);
       gl.uniform1i(pr.u.uHasPrev ?? null, this.hasPrev ? 1 : 0);
       gl.uniform1f(pr.u.uTemporal ?? null, 0.65);
       gl.uniform2f(pr.u.uEdge ?? null, EDGE_TUNE.lo, EDGE_TUNE.hi);
-      this.bindVeto(pr);
+      this.bindTex(3, this.mask, pr.u.uRaw);
       this.draw(dst, pr);
     } else {
       const pr = this.progs.refine;
@@ -908,7 +1100,6 @@ export class GlRenderer {
       gl.uniform1f(pr.u.uTemporal ?? null, 0.65);
       gl.uniform2f(pr.u.uEdge ?? null, EDGE_TUNE.lo, EDGE_TUNE.hi);
       gl.uniform1i(pr.u.uR ?? null, quality + 1);
-      this.bindVeto(pr);
       this.draw(dst, pr);
     }
     this.cur = 1 - this.cur;
@@ -916,29 +1107,56 @@ export class GlRenderer {
     this.maskDirty = false;
   }
 
+  /**
+   * Cronómetro de la gráfica: cuánto tarda de verdad en componer un cuadro.
+   * Se mide uno de cada ocho con una consulta asíncrona (no espera a nada).
+   */
+  private timeFrame(): boolean {
+    const gl = this.gl;
+    if (!this.timerOk) return false;
+    if (this.timerQuery) {
+      if (!gl.getQueryParameter(this.timerQuery, gl.QUERY_RESULT_AVAILABLE)) return false;
+      // un salto del reloj de la GPU (otra app, suspensión) invalida la medida
+      if (!gl.getParameter(GPU_DISJOINT_EXT)) {
+        const ms = (gl.getQueryParameter(this.timerQuery, gl.QUERY_RESULT) as number) / 1e6;
+        this.gpuMs = this.gpuMs ? this.gpuMs * 0.8 + ms * 0.2 : ms;
+      }
+      gl.deleteQuery(this.timerQuery);
+      this.timerQuery = null;
+    }
+    if (++this.timerTick % 8 !== 0) return false;
+    this.timerQuery = gl.createQuery();
+    if (!this.timerQuery) return false;
+    gl.beginQuery(TIME_ELAPSED_EXT, this.timerQuery);
+    return true;
+  }
+
   /** Compone el último cuadro subido con `upload`. */
   render(opt: GlRenderOptions): void {
     if (!this.hasFrame) return;
     const gl = this.gl;
     const q = opt.quality;
+    const timing = this.timeFrame();
     gl.bindVertexArray(this.vao);
     gl.disable(gl.BLEND);
 
-    // 0) limpiar ruido: de aquí en adelante todo lee el cuadro limpio
-    let src: WebGLTexture = this.video;
-    if (opt.denoise > 0 && q > 0) {
-      const dn = this.progs.denoise;
-      gl.useProgram(dn.p);
-      const dst = this.clean[1 - this.cleanCur];
-      this.bindTex(0, this.video, dn.u.uVideo);
-      this.bindTex(1, this.clean[this.cleanCur].tex, dn.u.uPrev);
-      gl.uniform1i(dn.u.uHasPrev ?? null, this.hasClean ? 1 : 0);
-      gl.uniform1f(dn.u.uStrength ?? null, opt.denoise);
-      this.draw(dst, dn);
-      this.cleanCur = 1 - this.cleanCur;
-      this.hasClean = true;
-      src = dst.tex;
-    } else this.hasClean = false;
+    // 0) limpiar ruido: de aquí en adelante todo lee el cuadro limpio. Corre
+    //    siempre (con la limpieza apagada copia tal cual): el cuadro anterior
+    //    hace falta para saber dónde hubo movimiento.
+    const dn = this.progs.denoise;
+    gl.useProgram(dn.p);
+    gl.uniform2f(dn.u.uTexel ?? null, 1 / this.W, 1 / this.H);
+    const cleanNow = this.clean[1 - this.cleanCur];
+    this.bindTex(0, this.video, dn.u.uVideo);
+    this.bindTex(1, this.clean[this.cleanCur].tex, dn.u.uPrev);
+    gl.uniform1i(dn.u.uHasPrev ?? null, this.hasClean ? 1 : 0);
+    gl.uniform1f(dn.u.uStrength ?? null, opt.denoise);
+    this.draw(cleanNow, dn);
+    // tras el cambio: clean[cleanCur] es este cuadro y clean[1 − cleanCur], el anterior
+    this.prevFrameOk = this.hasClean;
+    this.cleanCur = 1 - this.cleanCur;
+    this.hasClean = true;
+    const src: WebGLTexture = cleanNow.tex;
 
     let mode = opt.mode;
     if (mode === 2 && !this.hasBgImg) mode = 1;
@@ -963,22 +1181,23 @@ export class GlRenderer {
       gl.uniform2f(prep.u.uSpread ?? null, spread / this.W, spread / this.H);
       this.draw(this.blurA, prep);
       const radius = Math.max(1.5, opt.blurPx / 4);
-      if (mode === 1 && q > 0) {
-        // fondo desenfocado que se VE: bokeh tipo lente
+      if (mode === 1) {
+        // fondo desenfocado que se VE: bokeh tipo lente (en todas las calidades:
+        // con menos gráfica se abren los pasos de la espiral, no se cambia de desenfoque)
         const bk = this.progs.bokeh;
         gl.useProgram(bk.p);
         this.bindTex(0, this.blurA.tex, bk.u.uSrc);
         gl.uniform2f(bk.u.uTexel ?? null, 1 / this.blurA.w, 1 / this.blurA.h);
         gl.uniform1f(bk.u.uRadius ?? null, radius);
-        gl.uniform1f(bk.u.uStep ?? null, q === 2 ? 0.55 : 1.1);
+        gl.uniform1f(bk.u.uStep ?? null, q === 2 ? 0.55 : q === 1 ? 1.1 : 2.2);
         this.draw(this.blurB, bk);
         blurOut = this.blurB.tex;
       } else {
-        // gaussiana barata: el desenfoque visible en calidad baja y, con imagen
-        // de fondo, solo la estimación del fondo real para limpiar el borde
+        // con imagen de fondo: gaussiana barata, solo para estimar el fondo real
+        // y limpiar su color del borde
         const bl = this.progs.blur;
         gl.useProgram(bl.p);
-        const stepTexels = mode === 1 ? radius / 3.2 : (20 * (this.H / 1080)) / 4 / 6;
+        const stepTexels = (20 * (this.H / 1080)) / 4 / 6;
         this.bindTex(0, this.blurA.tex, bl.u.uSrc);
         gl.uniform2f(bl.u.uStep ?? null, stepTexels / this.blurA.w, 0);
         this.draw(this.blurB, bl);
@@ -1002,11 +1221,11 @@ export class GlRenderer {
     gl.uniform1f(c.u.uContrast ?? null, opt.contrast);
     gl.uniform1f(c.u.uSaturation ?? null, opt.saturation);
     gl.uniform1f(c.u.uWrap ?? null, opt.wrap);
-    gl.uniform1i(c.u.uWrapTaps ?? null, q === 2 ? 8 : q === 1 ? 4 : 0);
+    gl.uniform1i(c.u.uWrapTaps ?? null, q === 2 ? 8 : 4);
     gl.uniform3f(c.u.uTint ?? null, this.tint[0], this.tint[1], this.tint[2]);
     gl.uniform2f(c.u.uTexel ?? null, 1 / this.W, 1 / this.H);
     gl.uniform3f(c.u.uWb ?? null, opt.wb[0], opt.wb[1], opt.wb[2]);
-    gl.uniform1f(c.u.uSharpen ?? null, q > 0 ? opt.sharpen * 0.9 : 0);
+    gl.uniform1f(c.u.uSharpen ?? null, opt.sharpen);
     gl.uniform4f(c.u.uKey ?? null, opt.key[0], opt.key[1], opt.key[2], opt.key[3]);
     const st = STYLE_PARAMS[opt.style] ?? STYLE_PARAMS.natural;
     gl.uniform1f(c.u.uTemp ?? null, st.temp);
@@ -1022,15 +1241,17 @@ export class GlRenderer {
       for (let i = 0; i < ne; i++) {
         const e = eyes[i];
         this.eyeA.set([e.cx, e.cy, e.cos, e.sin], i * 4);
-        this.eyeB.set([e.ax, e.ay, e.irisR, e.reach], i * 4);
+        this.eyeB.set([e.ax, e.above, e.irisR, e.below], i * 4);
         this.eyeC.set([e.irisX, e.irisY, e.shiftX, e.shiftY], i * 4);
       }
       gl.uniform2f(c.u.uSize ?? null, this.W, this.H);
+      gl.uniform2f(c.u.uIrisPast ?? null, EYE_SHAPE.IRIS_PAST_UPPER, EYE_SHAPE.IRIS_PAST_LOWER);
       gl.uniform4fv(c.u.uEyeA ?? null, this.eyeA);
       gl.uniform4fv(c.u.uEyeB ?? null, this.eyeB);
       gl.uniform4fv(c.u.uEyeC ?? null, this.eyeC);
     }
     this.draw(null, c);
+    if (timing) gl.endQuery(TIME_ELAPSED_EXT);
   }
 
   /**

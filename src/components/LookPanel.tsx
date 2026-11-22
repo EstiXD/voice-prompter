@@ -225,6 +225,17 @@ export function LookPanel(p: Props) {
             {(p.background.kind === "preset" || p.background.kind === "custom") && (
               <Amount id="img-blur" label="Desenfocar la imagen" value={p.look.imageBlur} onChange={(v) => p.onLook({ ...p.look, imageBlur: v })} left="Nítida" right="Como de fondo lejano" />
             )}
+            {p.background.kind !== "none" && stats?.teacher && (
+              <Toggle
+                id="fx-chair"
+                checked={!!p.fx.keepChair}
+                onChange={(v) => p.onFx({ ...p.fx, keepChair: v })}
+                label="Conservar mi silla"
+                hint="Tu silla (o lo que tengas pegado detrás) se queda contigo fija, en vez de entrar y salir del recorte. Gasta más procesador."
+                icon={<IconFace className="h-4 w-4" />}
+                beta
+              />
+            )}
             <p className="mt-3 text-xs leading-snug text-paper-mute">
               Tu cara y tu cuerpo siempre quedan nítidos; solo cambia lo que hay detrás. Para un borde más limpio: luz de frente y algo de espacio entre tú y la pared. Tus imágenes se guardan en este navegador.
             </p>

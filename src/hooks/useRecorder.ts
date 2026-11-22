@@ -65,10 +65,13 @@ export function useRecorder() {
       if (!format) throw new Error("Este navegador no soporta MediaRecorder.");
       formatRef.current = format;
       kindRef.current = kind;
-      // video: ~10 Mbps a 1080p (calidad de YouTube 1080p alta); se escala con la resolución
+      // video: 8 Mbps a 720p y 16 a 1080p. El codificador en tiempo real del
+      // navegador rinde menos que uno de edición: con los ~4,5 Mbps de antes a
+      // 720p la piel y el fondo desenfocado salían con bloques. A este ritmo un
+      // minuto pesa ~60 MB a 720p.
       const vs = stream.getVideoTracks()[0]?.getSettings();
       const pixels = (vs?.width ?? 1920) * (vs?.height ?? 1080);
-      const videoBps = Math.round(Math.min(14_000_000, Math.max(4_000_000, (pixels / (1920 * 1080)) * 10_000_000)));
+      const videoBps = Math.round(Math.min(16_000_000, Math.max(6_000_000, (pixels / (1280 * 720)) * 8_000_000)));
       const opts: MediaRecorderOptions | undefined = format.mimeType
         ? kind === "video"
           ? { mimeType: format.mimeType, videoBitsPerSecond: videoBps, audioBitsPerSecond: 160_000 }

@@ -66,7 +66,10 @@ export class MicPipeline {
     this.comp.release.value = 0.25;
 
     this.makeup = ctx.createGain();
-    this.makeup.gain.value = 1.4;
+    // +9 dB. Medido en tomas reales: con +3 dB la voz quedaba a −20/−22 LUFS
+    // con picos a −7 dBFS (6 dB de margen sin usar); así queda sobre −16 LUFS,
+    // lo habitual en voz para video, y el limitador de después sujeta los picos.
+    this.makeup.gain.value = 2.8;
 
     this.limiter = ctx.createDynamicsCompressor();
     this.limiter.threshold.value = -3;

@@ -99,7 +99,7 @@ describe("warpEye", () => {
     const w = 80;
     const h = 40;
     const src = new Uint8ClampedArray(w * h * 4);
-    const e: EyeGeom = { a: { x: 20, y: 20 }, b: { x: 60, y: 20 }, center: { x: 40, y: 20 }, width: 40, open: 18, angle: 0, iris: { x: 40, y: 20 }, irisR: 6 };
+    const e: EyeGeom = { a: { x: 20, y: 20 }, b: { x: 60, y: 20 }, center: { x: 40, y: 20 }, width: 40, open: 18, above: 9, below: 9, angle: 0, iris: { x: 40, y: 20 }, irisR: 6 };
     // piel gris, esclerótica blanca (elipse), iris negro
     for (let y = 0; y < h; y++)
       for (let x = 0; x < w; x++) {
