@@ -1210,6 +1210,7 @@ export class VideoCompositor {
     const you = nobody ? [] : [fine.tones?.skin, fine.tones?.clothes];
     this.objects.update(this.vetoBuf, fine.data, fine.pixels, vw, vh, fine.w, you);
     this.gl.setYou(you[0], you[1]);
+    this.gl.setChair(this.objects.chairColors());
     // al borrar la silla, su zona se ensancha: se lleva el canto y le da margen para mecerse contigo
     this.gl.setTeach(this.objects.texture(fine.pixels, this.fx.keepChair ? 0 : 5, fine.data, fine.w), vw, vh);
   }

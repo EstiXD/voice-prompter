@@ -50,6 +50,9 @@ uniform vec4 uHead;         // tu cabeza (centro y radios, en coordenadas de ima
 uniform vec4 uHair;         // el color de tu pelo; a = 0 si no se pudo medir
 uniform vec4 uSkin;         // el de tu piel y el de tu ropa, igual
 uniform vec4 uClothes;
+uniform vec4 uChair0;       // los colores principales de la silla; a = 0 si no hay
+uniform vec4 uChair1;
+uniform vec4 uChair2;
 
 /**
  * ¿Este punto se ve como el objeto recordado ahí? 1 = igual; 0 = otra cosa
@@ -87,6 +90,17 @@ float likeTone(vec3 cur, vec4 ref) {
   float dark = 1.0 - smoothstep(0.3, 0.5, max(lc, lr));
   float plain = 1.0 - smoothstep(0.13, 0.30, length(cur - ref.rgb));
   return mix(tone * light, plain, dark);
+}
+
+/** Qué tan lejos está un color de otro, para decidir de quién es un punto: por tono, con algo de luz; en lo oscuro, a secas. */
+float colorGap(vec3 cur, vec4 ref) {
+  if (ref.a < 0.5) return 9.0;
+  float lc = cur.r + cur.g + cur.b;
+  float lr = ref.r + ref.g + ref.b;
+  vec3 d = abs(cur / max(lc, 1e-3) - ref.rgb / max(lr, 1e-3));
+  float tone = d.r + d.g + d.b + 0.08 * abs(log2(max(lc, 1e-3) / max(lr, 1e-3)));
+  float dark = 1.0 - smoothstep(0.3, 0.5, max(lc, lr));
+  return mix(tone, length(cur - ref.rgb), dark);
 }
 
 float sameAsRef(vec3 cur, vec2 uv) {
@@ -140,6 +154,12 @@ void main() {
         // rejilla gris del respaldo se parece a una camisa clara, pero es
         // justo lo que había).
         float you = max(likeTone(c, uSkin), likeTone(c, uClothes)) * (1.0 - same);
+        // Y si se parece a ti pero MÁS a la silla, es silla: con luz cálida, el
+        // naranja de un respaldo en sombra queda cerca del tono de la piel y
+        // se salvaba a medias (pedazos translúcidos).
+        float gapYou = min(colorGap(c, uSkin), colorGap(c, uClothes));
+        float gapChair = min(colorGap(c, uChair0), min(colorGap(c, uChair1), colorGap(c, uChair2)));
+        you *= 1.0 - smoothstep(-0.015, 0.015, gapYou - gapChair);
         // Dentro de tu cabeza, al revés: solo se va lo que es la silla de ahí
         // y no tiene el color de tu pelo. Un pelo negro delante de un respaldo
         // negro es igual que el recuerdo, y borrarlo abría un hueco en el pelo.
@@ -797,6 +817,8 @@ export class GlRenderer {
   /** los de tu piel y tu ropa, igual */
   private skin: [number, number, number, number] = [0, 0, 0, 0];
   private clothes: [number, number, number, number] = [0, 0, 0, 0];
+  /** los colores principales de la silla (hasta tres), igual */
+  private chair: [number, number, number, number][] = [];
   /** cuándo llegó el último veto (performance.now); 0 = no hay */
   private vetoAt = 0;
 
@@ -1041,6 +1063,11 @@ export class GlRenderer {
     this.vetoAt = 0;
   }
 
+  /** Los colores principales de la silla (RGB 0–255, hasta tres): al borrarla, lo que se les parece más que a ti se va. */
+  setChair(colors: readonly (readonly number[])[]): void {
+    this.chair = colors.slice(0, 3).map((c) => [c[0] / 255, c[1] / 255, c[2] / 255, 1]);
+  }
+
   /** Tus colores (RGB 0–255, o nada si no se midieron): lo que los tiene no se borra con la silla. */
   setYou(skin?: readonly number[] | null, clothes?: readonly number[] | null): void {
     this.skin = skin ? [skin[0] / 255, skin[1] / 255, skin[2] / 255, 1] : [0, 0, 0, 0];
@@ -1071,6 +1098,13 @@ export class GlRenderer {
     gl.uniform4f(pr.u.uHair ?? null, this.hair[0], this.hair[1], this.hair[2], this.hair[3]);
     gl.uniform4f(pr.u.uSkin ?? null, this.skin[0], this.skin[1], this.skin[2], this.skin[3]);
     gl.uniform4f(pr.u.uClothes ?? null, this.clothes[0], this.clothes[1], this.clothes[2], this.clothes[3]);
+    const none = [0, 0, 0, 0];
+    const c0 = this.chair[0] ?? none;
+    const c1 = this.chair[1] ?? none;
+    const c2 = this.chair[2] ?? none;
+    gl.uniform4f(pr.u.uChair0 ?? null, c0[0], c0[1], c0[2], c0[3]);
+    gl.uniform4f(pr.u.uChair1 ?? null, c1[0], c1[1], c1[2], c1[3]);
+    gl.uniform4f(pr.u.uChair2 ?? null, c2[0], c2[1], c2[2], c2[3]);
   }
 
   get hasMask(): boolean {

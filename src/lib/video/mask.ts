@@ -457,6 +457,8 @@ export class ObjectTracker {
   private ok: Uint8Array | null = null;
   /** colores de la silla: cuántas veces se sembró cada casilla de color (se va olvidando) */
   private readonly palette = new Float32Array(512);
+  /** y la suma de los colores sembrados en cada casilla (RGB), para saber su color medio */
+  private readonly paletteSum = new Float32Array(512 * 3);
   private queue: Int32Array | null = null;
   private depth: Uint8Array | null = null;
   /** tus colores en esta pasada (primero la piel, luego la ropa): lo que se les parece no es un objeto */
@@ -468,6 +470,31 @@ export class ObjectTracker {
   reset(): void {
     this.acc?.fill(0);
     this.palette.fill(0);
+    this.paletteSum.fill(0);
+  }
+
+  /**
+   * Los colores principales de la silla (RGB 0–255), de más a menos sembrado.
+   * Sirven para decidir, al borrarla, de quién es un punto dudoso: el naranja
+   * de un respaldo en sombra queda cerca del tono de la piel, pero más cerca
+   * todavía del naranja de la silla.
+   */
+  chairColors(max = 3): number[][] {
+    const pal = this.palette;
+    let total = 0;
+    for (let b = 0; b < 512; b++) total += pal[b];
+    if (total < OBJECT.PALETTE_POINTS) return [];
+    const picked: number[] = [];
+    for (let k = 0; k < max; k++) {
+      let best = -1;
+      for (let b = 0; b < 512; b++) {
+        if (pal[b] < total * OBJECT.PALETTE_MIN || picked.includes(b)) continue;
+        if (best < 0 || pal[b] > pal[best]) best = b;
+      }
+      if (best < 0) break;
+      picked.push(best);
+    }
+    return picked.map((b) => [this.paletteSum[b * 3] / pal[b], this.paletteSum[b * 3 + 1] / pal[b], this.paletteSum[b * 3 + 2] / pal[b]]);
   }
 
   /**
@@ -486,8 +513,17 @@ export class ObjectTracker {
     // la paleta: se olvida un poco y suma lo sembrado en esta pasada que ya se
     // había sembrado antes ahí mismo (lo que no se va de su sitio)
     let palTotal = 0;
+    const sum = this.paletteSum;
     for (let b = 0; b < 512; b++) pal[b] *= OBJECT.PALETTE_KEEP;
-    for (let i = 0; i < n; i++) if (ok[i] === 1 && acc[i] > 0) pal[colorBin(rgba, i)]++;
+    for (let b = 0; b < 512 * 3; b++) sum[b] *= OBJECT.PALETTE_KEEP;
+    for (let i = 0; i < n; i++) {
+      if (ok[i] !== 1 || acc[i] <= 0) continue;
+      const b = colorBin(rgba, i);
+      pal[b]++;
+      sum[b * 3] += rgba[i * 4];
+      sum[b * 3 + 1] += rgba[i * 4 + 1];
+      sum[b * 3 + 2] += rgba[i * 4 + 2];
+    }
     for (let b = 0; b < 512; b++) palTotal += pal[b];
     if (palTotal < OBJECT.PALETTE_POINTS) return;
     // de dónde se parte: semillas admitidas y lo firme que conserva su color

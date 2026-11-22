@@ -360,6 +360,39 @@ describe("ObjectTracker", () => {
     expect(at(o, 24, 15, VW)).toBe(255);
   });
 
+  describe("chairColors", () => {
+    it("da los colores de la silla, el más sembrado primero, y nada antes de reconocerla", () => {
+      const t = new ObjectTracker();
+      const BLACK = [22, 22, 26];
+      // dos tercios naranja, un tercio negro
+      const px = frame([
+        [22, 10, 28, 20, CHAIR],
+        [22, 17, 28, 20, BLACK],
+      ]);
+      t.update(chairSeed, person, px, VW, VH, W);
+      expect(t.chairColors()).toEqual([]); // una sola pasada: aún no hay paleta
+      t.update(chairSeed, person, px, VW, VH, W);
+      const colors = t.chairColors();
+      expect(colors.length).toBe(2);
+      expect(colors[0].map(Math.round)).toEqual(CHAIR);
+      expect(colors[1].map(Math.round)).toEqual(BLACK);
+    });
+
+    it("no incluye tus colores: lo que tiene tu piel nunca se siembra", () => {
+      const t = new ObjectTracker();
+      const SKIN = [205, 150, 120];
+      const px = frame([
+        [22, 10, 28, 20, CHAIR],
+        [22, 20, 28, 23, [212, 156, 124]],
+      ]);
+      const seed = half([[22, 10, 28, 23, 255]]);
+      for (let i = 0; i < 3; i++) t.update(seed, person, px, VW, VH, W, [SKIN]);
+      const colors = t.chairColors();
+      expect(colors.length).toBe(1);
+      expect(colors[0].map(Math.round)).toEqual(CHAIR);
+    });
+  });
+
   describe("classTone", () => {
     it("da el color medio de la clase y null si hay muy pocos puntos", () => {
       const px = frame([[4, 4, 12, 12, [200, 150, 120]]]);
