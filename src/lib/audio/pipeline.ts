@@ -1,14 +1,16 @@
-// Cadena de audio del micrófono: captura → [RNNoise] → [pasa-altos → compresor →
-// make-up → limitador] → destino (MediaRecorder / reconocimiento) + analizador (VU).
+// Cadena de audio del micrófono: captura → [RNNoise] → [cadena de voz: ecualización,
+// aire, compresor, limitador (ver voice.ts)] → destino (MediaRecorder /
+// reconocimiento) + analizador (VU).
 // Nunca se conecta a ctx.destination: no queremos oírnos (feedback).
 
 import type { RnnoiseWorkletNode } from "@sapphi-red/web-noise-suppressor";
 import { createRnnoiseNode } from "./rnnoise";
+import { buildVoiceChain, type VoiceChain } from "./voice";
 
 export type PipelineFlags = {
   /** supresión de ruido IA (RNNoise) */
   rnnoise: boolean;
-  /** pasa-altos + compresor + limitador */
+  /** cadena de voz: ecualización + aire + compresor + limitador */
   enhance: boolean;
 };
 
@@ -30,11 +32,7 @@ export class MicPipeline {
   readonly processedStream: MediaStream;
 
   private readonly source: MediaStreamAudioSourceNode;
-  private readonly hp: BiquadFilterNode;
-  private readonly presence: BiquadFilterNode;
-  private readonly comp: DynamicsCompressorNode;
-  private readonly makeup: GainNode;
-  private readonly limiter: DynamicsCompressorNode;
+  private readonly chain: VoiceChain;
   private readonly dest: MediaStreamAudioDestinationNode;
   private rnnoiseNode: RnnoiseWorkletNode | null = null;
   private flags: PipelineFlags;
@@ -47,36 +45,8 @@ export class MicPipeline {
 
     this.source = ctx.createMediaStreamSource(rawStream);
 
-    this.hp = ctx.createBiquadFilter();
-    this.hp.type = "highpass";
-    this.hp.frequency.value = 85;
-    this.hp.Q.value = 0.7;
-
-    this.presence = ctx.createBiquadFilter();
-    this.presence.type = "peaking";
-    this.presence.frequency.value = 3000;
-    this.presence.Q.value = 0.9;
-    this.presence.gain.value = 1.5;
-
-    this.comp = ctx.createDynamicsCompressor();
-    this.comp.threshold.value = -24;
-    this.comp.knee.value = 12;
-    this.comp.ratio.value = 3;
-    this.comp.attack.value = 0.003;
-    this.comp.release.value = 0.25;
-
-    this.makeup = ctx.createGain();
-    // +9 dB. Medido en tomas reales: con +3 dB la voz quedaba a −20/−22 LUFS
-    // con picos a −7 dBFS (6 dB de margen sin usar); así queda sobre −16 LUFS,
-    // lo habitual en voz para video, y el limitador de después sujeta los picos.
-    this.makeup.gain.value = 2.8;
-
-    this.limiter = ctx.createDynamicsCompressor();
-    this.limiter.threshold.value = -3;
-    this.limiter.knee.value = 0;
-    this.limiter.ratio.value = 20;
-    this.limiter.attack.value = 0.001;
-    this.limiter.release.value = 0.1;
+    // la cadena de voz queda armada por dentro; rewire() solo decide qué entra y qué sale
+    this.chain = buildVoiceChain(ctx);
 
     this.dest = ctx.createMediaStreamDestination();
     // Voz = mono. Sin esto el stream sale estéreo (mono duplicado) y los
@@ -158,8 +128,9 @@ export class MicPipeline {
     this.rewire();
   }
 
+  /** Suelta lo que entra y sale de la cadena de voz (por dentro sigue armada). */
   private disconnectAll(): void {
-    for (const n of [this.source, this.rnnoiseNode, this.hp, this.presence, this.comp, this.makeup, this.limiter]) {
+    for (const n of [this.source, this.rnnoiseNode, this.chain.output]) {
       try {
         n?.disconnect();
       } catch {
@@ -170,18 +141,18 @@ export class MicPipeline {
 
   private rewire(): void {
     this.disconnectAll();
+    const noise = this.flags.rnnoise && this.rnnoiseNode ? this.rnnoiseNode : null;
     let head: AudioNode = this.source;
-    if (this.flags.rnnoise && this.rnnoiseNode) {
-      head.connect(this.rnnoiseNode);
-      head = this.rnnoiseNode;
+    if (noise) {
+      head.connect(noise);
+      head = noise;
     }
     if (this.flags.enhance) {
-      head.connect(this.hp);
-      this.hp.connect(this.presence);
-      this.presence.connect(this.comp);
-      this.comp.connect(this.makeup);
-      this.makeup.connect(this.limiter);
-      head = this.limiter;
+      head.connect(this.chain.input);
+      // el micrófono sin limpiar solo hace falta para devolverle a la voz los
+      // agudos que el quita-ruido se lleva
+      if (noise) this.source.connect(this.chain.dryInput);
+      head = this.chain.output;
     }
     head.connect(this.dest);
     head.connect(this.analyser);
@@ -191,6 +162,13 @@ export class MicPipeline {
     if (this.destroyed) return;
     this.destroyed = true;
     this.disconnectAll();
+    for (const n of this.chain.nodes) {
+      try {
+        n.disconnect();
+      } catch {
+        /* ya desconectado */
+      }
+    }
     try {
       this.rnnoiseNode?.destroy();
     } catch {

@@ -277,11 +277,20 @@ export function vetoMap(fast: Uint8Array, fine: Uint8Array, w: number, h: number
 
 export const OBJECT = {
   /**
-   * Diferencia de color (suma de los tres canales, 0–765) hasta la que un
-   * punto "sigue siendo el mismo". Ajustado: una camisa blanca y una cortina
-   * crema se llevan ~85, y no son lo mismo.
+   * Cuándo un punto "sigue siendo el mismo" de una pasada a otra: el mismo
+   * TONO (distancia entre proporciones de rojo, verde y azul, hasta
+   * SAME_TONE) con una luz parecida (entre SAME_DARKER y SAME_BRIGHTER veces).
+   * Por tono y no por diferencia a secas: el naranja de un respaldo cambia
+   * mucho de brillo con tu sombra y con la exposición de la cámara, y medido
+   * a secas nunca "era el mismo" dos pasadas seguidas (no llegaba a firme).
+   * Una camisa blanca y una cortina crema se llevan 0,08 de tono: no son lo
+   * mismo. En lo oscuro el tono es ruido: ahí vale la diferencia a secas
+   * (suma de los tres canales, 0–765) hasta SAME.
    */
   SAME: 45,
+  SAME_TONE: 0.06,
+  SAME_DARKER: 0.7,
+  SAME_BRIGHTER: 1.43,
   /** cuánto conserva por pasada un punto que el modelo rápido no volvió a reclamar */
   KEEP: 0.92,
   /**
@@ -295,22 +304,117 @@ export const OBJECT = {
   CANDIDATE_MIN: 48,
   /**
    * El modelo rápido también reclama de más alrededor de una mano levantada,
-   * y eso es pared. Para distinguirlo de una silla: el color de la pared está
-   * por todas partes, también LEJOS de la mancha; el naranja de una silla solo
-   * está en la silla. Una mancha de semillas vale como objeto si al menos
-   * BLOB_RARE de sus puntos tienen un color que lejos de las semillas casi no
-   * aparece (menos de FAR_SHARE de lo que hay allí). Se decide por mancha
-   * entera: así las franjas negras de la silla entran con las naranjas.
+   * y eso es pared. Para distinguirlo de una silla, cada semilla se compara
+   * con el FONDO SEGURO QUE TIENE AL LADO (la media de lo que ninguno de los
+   * dos modelos reclama, en una ventana de este ancho a cada lado, fracción de
+   * la imagen): la pared de junto a la mano es igual a la pared de al lado; la
+   * silla, no.
+   *
+   * (Antes se miraba si el color era raro LEJOS de las semillas. Fallaba al
+   * revés: un respaldo negro no entraba, porque negro hay en cualquier cuarto,
+   * y sí entraba la pared pegada a una mano, arrastrada por el color de la piel.)
    */
-  FAR_SHARE: 0.015,
-  BLOB_RARE: 0.35,
-  /** manchas más chicas que esto (puntos a media resolución) no cuentan */
-  BLOB_MIN: 6,
-  /** "lejos": fuera de las casillas de este ancho (fracción de la imagen) que tocan una semilla, y de sus vecinas */
-  NEAR_TILE: 0.07,
-  /** si lo que queda lejos es menos que esta fracción de la imagen, no hay con qué comparar: no se admite nada */
-  FAR_MIN: 0.08,
+  NEAR: 0.08,
+  /**
+   * Hace falta al menos esta parte de la ventana con fondo seguro para
+   * comparar; si no la hay, se mira más lejos. Y si ni en el cuadro entero
+   * hay con qué comparar, no se admite nada: recordar de más deja manchas.
+   */
+  NEAR_MIN: 0.06,
+  /**
+   * "No es el fondo de al lado" si cambia el TONO (distancia entre las
+   * proporciones de rojo, verde y azul; una pared crema y un naranja se llevan
+   * 0,5; la misma pared con sombra, menos de 0,03)…
+   */
+  TONE: 0.09,
+  /**
+   * …o si es MUCHO más oscuro o más claro que ese fondo (luz de la semilla
+   * entre la del fondo). Una sombra sobre la pared la deja en 0,6–0,85: no
+   * llega. Un respaldo negro, por debajo de 0,3.
+   */
+  DARKER: 0.45,
+  BRIGHTER: 1.8,
+  /** con menos luz que esta (suma de canales) el tono es puro ruido del sensor: solo cuenta la luz */
+  TONE_MIN_LIGHT: 90,
+  /**
+   * El modelo rápido reclama la silla a trozos (el naranja pegado al cuello sí,
+   * el respaldo negro casi nunca). El resto se alcanza CRECIENDO desde lo
+   * sembrado hacia lo que está pegado y tiene los colores de la silla. Hasta
+   * esta distancia de una semilla (fracción del ancho): más allá ya no es "lo
+   * que tienes pegado detrás".
+   */
+  GROW: 0.14,
+  /**
+   * Un color es "de la silla" si es al menos esta parte de la paleta. A la
+   * paleta solo entra lo que se siembra POR SEGUNDA VEZ en el mismo sitio:
+   * una mano que gesticula se siembra cada vez en un sitio distinto y no deja
+   * su color. Que el color de la silla también esté en un
+   * mueble del cuarto no importa: solo se crece hacia lo que TOCA a la silla,
+   * y con tope de distancia.
+   */
+  PALETTE_MIN: 0.03,
+  /**
+   * Además, lo que se alcanza al crecer tiene que distinguirse del fondo de
+   * alrededor igual que una semilla, mirando una ventana este número de veces
+   * más ancha (una silla ancha no debe ser "su propio fondo"). Es lo que
+   * impide llevarse la pared cuando su color cae cerca de uno de la paleta:
+   * la palma de una mano y una pared crema se parecen demasiado.
+   */
+  GROW_NEAR: 3,
+  /** cuánto conserva la paleta por pasada (la piel de una mano que se sembró un momento se olvida) */
+  PALETTE_KEEP: 0.9,
+  /** con menos puntos sembrados que esto la paleta no dice nada: no se crece */
+  PALETTE_POINTS: 12,
+  /**
+   * "Se parece a ti": mismo tono que tu piel o tu ropa (los colores medios de
+   * lo que el modelo fino sí etiquetó como piel y como ropa en ese cuadro) y
+   * una luz no muy distinta. Al modelo fino se le escapan a veces una mano
+   * levantada o un antebrazo apoyado; sin esto pasaban por "objeto", y al
+   * BORRAR los objetos se abría un hueco en la mano.
+   */
+  YOU_TONE: 0.06,
+  YOU_DARKER: 0.5,
+  YOU_BRIGHTER: 1.8,
+  /** hacen falta al menos estos puntos de una clase para fiarse de su color medio */
+  YOU_POINTS: 24,
 };
+
+/** Un color de referencia tuyo (piel, ropa): RGB medio, o null si no se pudo medir. */
+export type Tone = readonly number[] | null | undefined;
+
+/**
+ * Color medio (RGB) de lo que el modelo fino etiqueta como una clase. `mask` y
+ * `extra` (opcional: se toma el mayor de los dos, p. ej. piel de cara y piel
+ * de cuerpo) van a resolución completa (ancho `w`); `rgba`, a la mitad.
+ */
+export function classTone(mask: Float32Array, w: number, rgba: Uint8Array, vw: number, vh: number, extra?: Float32Array): [number, number, number] | null {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let n = 0;
+  for (let y = 0; y < vh; y++) {
+    for (let x = 0; x < vw; x++) {
+      const k = y * 2 * w + x * 2;
+      if (mask[k] < 0.6 && !(extra && extra[k] >= 0.6)) continue;
+      const i = (y * vw + x) * 4;
+      r += rgba[i];
+      g += rgba[i + 1];
+      b += rgba[i + 2];
+      n++;
+    }
+  }
+  return n >= OBJECT.YOU_POINTS ? [r / n, g / n, b / n] : null;
+}
+
+/** ¿Dos colores son "el mismo" de una pasada a otra? (ver OBJECT.SAME) */
+export function sameColor(r: number, g: number, b: number, cr: number, cg: number, cb: number): boolean {
+  const light = r + g + b;
+  const ref = cr + cg + cb;
+  if (light < OBJECT.TONE_MIN_LIGHT || ref < OBJECT.TONE_MIN_LIGHT) return Math.abs(r - cr) + Math.abs(g - cg) + Math.abs(b - cb) <= OBJECT.SAME;
+  const ratio = light / ref;
+  if (ratio < OBJECT.SAME_DARKER || ratio > OBJECT.SAME_BRIGHTER) return false;
+  return Math.abs(r / light - cr / ref) + Math.abs(g / light - cg / ref) + Math.abs(b / light - cb / ref) <= OBJECT.SAME_TONE;
+}
 
 /** casilla de color gruesa: 8 niveles por canal */
 const colorBin = (rgba: Uint8Array, i: number) => ((rgba[i * 4] >> 5) << 6) | ((rgba[i * 4 + 1] >> 5) << 3) | (rgba[i * 4 + 2] >> 5);
@@ -321,17 +425,25 @@ const colorBin = (rgba: Uint8Array, i: number) => ((rgba[i * 4] >> 5) << 6) | ((
  * pelearse con él, lo que reclama se RECUERDA y se deja fijo:
  *
  *   · semillas: lo que el modelo rápido reclama y el fino, en el mismo
- *     cuadro, dice que no eres tú (ver `vetoMap`);
+ *     cuadro, dice que no eres tú (ver `vetoMap`), siempre que no se vea como
+ *     el fondo de al lado (ver OBJECT.NEAR);
  *   · cada punto sembrado guarda el color que tenía; con dos siembras sobre
  *     el mismo color queda firme. Desde entonces sigue siendo objeto mientras
  *     conserve ese color, aunque el modelo rápido esta vez no lo reclame (se
  *     va aflojando muy despacio);
  *   · si el color cambió (moviste la silla, pusiste otra cosa) o el fino ve
- *     ahí una persona, se suelta en el acto.
+ *     ahí una persona, se suelta en el acto;
+ *   · lo que tiene el color de tu piel o de tu ropa nunca es objeto (ver
+ *     OBJECT.YOU_TONE).
  *
- * A propósito NO crece por parecido de color hacia el resto del objeto: se
- * probó y, en una habitación real, se llevaba la cortina y la pared. Así
- * cubre solo lo que el modelo rápido ya incluía, pero entero y sin parpadeo.
+ * Con el objeto reconocido, quien lo usa decide: conservarlo contigo (firme,
+ * sin parpadeo) o borrarlo con el fondo.
+ *
+ *   · lo sembrado CRECE hacia lo que tiene pegado con los colores de la silla
+ *     (ver OBJECT.GROW): así entra el respaldo entero y no solo el trozo que
+ *     el modelo rápido reclama. La primera versión de esto se llevaba la
+ *     cortina y la pared; ahora el color de la pared no llega a la paleta
+ *     (no se siembra) y el crecimiento tiene tope de distancia.
  *
  * Todo a media resolución. Puro: con tests.
  */
@@ -339,149 +451,236 @@ export class ObjectTracker {
   private acc: Uint8Array | null = null;
   /** color (RGB) de cada punto cuando se sembró */
   private col: Uint8Array | null = null;
-  private readonly farBins = new Uint32Array(512);
-  /** 0 = sin mirar · 1 = semilla admitida · 2 = semilla descartada */
+  /** sumas acumuladas (tabla de áreas) del fondo seguro: rojo, verde, azul y cuántos puntos */
+  private sum: [Uint32Array, Uint32Array, Uint32Array, Uint32Array] | null = null;
+  /** 0 = nada · 1 = semilla admitida · 2 = semilla descartada (se ve como el fondo de al lado) · 3 = alcanzado al crecer */
   private ok: Uint8Array | null = null;
-  private stack: Int32Array | null = null;
+  /** colores de la silla: cuántas veces se sembró cada casilla de color (se va olvidando) */
+  private readonly palette = new Float32Array(512);
+  private queue: Int32Array | null = null;
+  private depth: Uint8Array | null = null;
+  /** tus colores en esta pasada (primero la piel, luego la ropa): lo que se les parece no es un objeto */
+  private you: Tone[] = [];
+  /** las semillas de la última pasada (ver `texture`) */
+  private lastSeed: Uint8Array | null = null;
+  private tex: Uint8Array | null = null;
 
   reset(): void {
     this.acc?.fill(0);
+    this.palette.fill(0);
   }
 
   /**
-   * Qué semillas son de verdad un objeto (ver OBJECT.FAR_SHARE). Devuelve un
-   * mapa por punto: 1 = semilla admitida, 2 = semilla descartada, 0 = no es semilla.
+   * Desde lo sembrado (y lo que ya era firme) hacia los vecinos que tienen un
+   * color de la silla (ver OBJECT.GROW y PALETTE_*). Marca lo alcanzado con 3.
+   */
+  private grow(ok: Uint8Array, fine: Uint8Array, rgba: Uint8Array, vw: number, vh: number, w: number): void {
+    const n = vw * vh;
+    const acc = this.acc!;
+    const col = this.col!;
+    const pal = this.palette;
+    const queue = this.queue!;
+    const depth = this.depth!;
+    const same = (i: number) => sameColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], col[i * 3], col[i * 3 + 1], col[i * 3 + 2]);
+    const firmNow = (i: number) => acc[i] > 102 && same(i);
+    // la paleta: se olvida un poco y suma lo sembrado en esta pasada que ya se
+    // había sembrado antes ahí mismo (lo que no se va de su sitio)
+    let palTotal = 0;
+    for (let b = 0; b < 512; b++) pal[b] *= OBJECT.PALETTE_KEEP;
+    for (let i = 0; i < n; i++) if (ok[i] === 1 && acc[i] > 0) pal[colorBin(rgba, i)]++;
+    for (let b = 0; b < 512; b++) palTotal += pal[b];
+    if (palTotal < OBJECT.PALETTE_POINTS) return;
+    // de dónde se parte: semillas admitidas y lo firme que conserva su color
+    let tail = 0;
+    for (let y = 0; y < vh; y++) {
+      for (let x = 0; x < vw; x++) {
+        const i = y * vw + x;
+        depth[i] = 255;
+        if (fine[y * 2 * w + x * 2] < 128 && (ok[i] === 1 || firmNow(i))) {
+          depth[i] = 0;
+          queue[tail++] = i;
+        }
+      }
+    }
+    const reach = Math.min(250, Math.max(2, Math.round(vw * OBJECT.GROW)));
+    const wide = Math.max(3, Math.round(vw * OBJECT.NEAR)) * OBJECT.GROW_NEAR;
+    const fits = (i: number) => pal[colorBin(rgba, i)] >= palTotal * OBJECT.PALETTE_MIN;
+    for (let head = 0; head < tail; head++) {
+      const i = queue[head];
+      const d = depth[i];
+      if (d >= reach) continue;
+      const x = i % vw;
+      const y = (i / vw) | 0;
+      for (let k = 0; k < 4; k++) {
+        const nx = k === 0 ? x - 1 : k === 1 ? x + 1 : x;
+        const ny = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
+        if (nx < 0 || nx >= vw || ny < 0 || ny >= vh) continue;
+        const j = ny * vw + nx;
+        // ya visto, descartado por parecerse al fondo de al lado, o eres tú
+        if (depth[j] !== 255 || ok[j] === 2 || fine[ny * 2 * w + nx * 2] >= 128) continue;
+        if (!fits(j) || this.likeYou(j, rgba) || !this.standsOut(nx, ny, wide, rgba, vw, vh)) continue;
+        depth[j] = d + 1;
+        if (ok[j] === 0) ok[j] = 3;
+        queue[tail++] = j;
+      }
+    }
+  }
+
+  /** ¿Este punto tiene el color `t` (tu piel, tu ropa)? (ver OBJECT.YOU_TONE) */
+  private likeTone(i: number, rgba: Uint8Array, t: Tone): boolean {
+    if (!t) return false;
+    const pr = rgba[i * 4];
+    const pg = rgba[i * 4 + 1];
+    const pb = rgba[i * 4 + 2];
+    const light = pr + pg + pb;
+    const tl = t[0] + t[1] + t[2];
+    const ratio = light / Math.max(1, tl);
+    if (ratio < OBJECT.YOU_DARKER || ratio > OBJECT.YOU_BRIGHTER) return false;
+    // con poca luz el tono no se puede medir: basta con que la luz se parezca
+    if (light < OBJECT.TONE_MIN_LIGHT || tl < OBJECT.TONE_MIN_LIGHT) return true;
+    return Math.abs(pr / light - t[0] / tl) + Math.abs(pg / light - t[1] / tl) + Math.abs(pb / light - t[2] / tl) < OBJECT.YOU_TONE;
+  }
+
+  /** ¿Este punto tiene el color de tu piel o de tu ropa? */
+  private likeYou(i: number, rgba: Uint8Array): boolean {
+    for (const t of this.you) if (this.likeTone(i, rgba, t)) return true;
+    return false;
+  }
+
+  /**
+   * Qué semillas son de verdad un objeto y cuáles son fondo reclamado de más
+   * (ver OBJECT.NEAR). Devuelve un mapa por punto: 1 = admitida, 2 =
+   * descartada, 0 = no es semilla.
    */
   private admit(seed: Uint8Array, fine: Uint8Array, rgba: Uint8Array, vw: number, vh: number, w: number): Uint8Array {
-    const n = vw * vh;
     const ok = this.ok!;
-    const stack = this.stack!;
+    const [sr, sg, sb, sn] = this.sum!;
     ok.fill(0);
-    // 1) casillas "cerca": las que tocan una semilla y sus ocho vecinas
-    const T = Math.max(4, Math.round(vw * OBJECT.NEAR_TILE));
-    const tw = Math.ceil(vw / T);
-    const th = Math.ceil(vh / T);
-    const near = new Uint8Array(tw * th);
-    let any = false;
+    // 1) tabla de áreas del fondo seguro: lo que ni el modelo rápido ni el fino reclaman
+    const sw = vw + 1;
     for (let y = 0; y < vh; y++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let c = 0;
       for (let x = 0; x < vw; x++) {
-        if (seed[y * vw + x] <= 127) continue;
-        any = true;
-        const tx = (x / T) | 0;
-        const ty = (y / T) | 0;
-        for (let dy = -1; dy <= 1; dy++)
-          for (let dx = -1; dx <= 1; dx++) {
-            const ax = tx + dx;
-            const ay = ty + dy;
-            if (ax >= 0 && ax < tw && ay >= 0 && ay < th) near[ay * tw + ax] = 1;
-          }
+        const i = y * vw + x;
+        if (seed[i] < 32 && fine[y * 2 * w + x * 2] < 64) {
+          r += rgba[i * 4];
+          g += rgba[i * 4 + 1];
+          b += rgba[i * 4 + 2];
+          c++;
+        }
+        const o = (y + 1) * sw + x + 1;
+        const up = y * sw + x + 1;
+        sr[o] = sr[up] + r;
+        sg[o] = sg[up] + g;
+        sb[o] = sb[up] + b;
+        sn[o] = sn[up] + c;
       }
     }
-    if (!any) return ok;
-    // 2) colores de lo que queda lejos (y no eres tú)
-    const far = this.farBins;
-    far.fill(0);
-    let farTotal = 0;
+    // 2) cada semilla, contra la media del fondo seguro de su ventana
+    const R = Math.max(3, Math.round(vw * OBJECT.NEAR));
     for (let y = 0; y < vh; y++) {
       for (let x = 0; x < vw; x++) {
-        if (near[((y / T) | 0) * tw + ((x / T) | 0)] || fine[y * 2 * w + x * 2] >= 128) continue;
-        far[colorBin(rgba, y * vw + x)]++;
-        farTotal++;
-      }
-    }
-    const judge = farTotal >= n * OBJECT.FAR_MIN;
-    const limit = farTotal * OBJECT.FAR_SHARE;
-    // 3) por manchas: se admite entera si bastantes de sus puntos tienen un color que lejos no aparece
-    for (let s0 = 0; s0 < n; s0++) {
-      if (seed[s0] <= 127 || ok[s0]) continue;
-      let top = 0;
-      let count = 0;
-      let rare = 0;
-      stack[top++] = s0;
-      ok[s0] = 2;
-      const first = s0;
-      while (top > 0) {
-        const i = stack[--top];
-        count++;
-        if (far[colorBin(rgba, i)] < limit) rare++;
-        const x = i % vw;
-        if (x > 0 && seed[i - 1] > 127 && !ok[i - 1]) {
-          ok[i - 1] = 2;
-          stack[top++] = i - 1;
-        }
-        if (x < vw - 1 && seed[i + 1] > 127 && !ok[i + 1]) {
-          ok[i + 1] = 2;
-          stack[top++] = i + 1;
-        }
-        if (i >= vw && seed[i - vw] > 127 && !ok[i - vw]) {
-          ok[i - vw] = 2;
-          stack[top++] = i - vw;
-        }
-        if (i + vw < n && seed[i + vw] > 127 && !ok[i + vw]) {
-          ok[i + vw] = 2;
-          stack[top++] = i + vw;
-        }
-      }
-      if (!judge || count < OBJECT.BLOB_MIN || rare < count * OBJECT.BLOB_RARE) continue;
-      // admitida: se vuelve a recorrer la mancha marcándola con 1
-      top = 0;
-      stack[top++] = first;
-      ok[first] = 1;
-      while (top > 0) {
-        const i = stack[--top];
-        const x = i % vw;
-        if (x > 0 && ok[i - 1] === 2 && seed[i - 1] > 127) {
-          ok[i - 1] = 1;
-          stack[top++] = i - 1;
-        }
-        if (x < vw - 1 && ok[i + 1] === 2 && seed[i + 1] > 127) {
-          ok[i + 1] = 1;
-          stack[top++] = i + 1;
-        }
-        if (i >= vw && ok[i - vw] === 2 && seed[i - vw] > 127) {
-          ok[i - vw] = 1;
-          stack[top++] = i - vw;
-        }
-        if (i + vw < n && ok[i + vw] === 2 && seed[i + vw] > 127) {
-          ok[i + vw] = 1;
-          stack[top++] = i + vw;
-        }
+        const i = y * vw + x;
+        if (seed[i] > 127) ok[i] = this.standsOut(x, y, R, rgba, vw, vh) && !this.likeYou(i, rgba) ? 1 : 2;
       }
     }
     return ok;
   }
 
   /**
-   * `seed`: semillas (vw×vh, >127 = semilla). `fine`: máscara del modelo fino
-   * a resolución completa (ancho `w`). `rgba`: el cuadro a vw×vh. Devuelve el
-   * mapa del objeto (vw×vh, 0–255); vale hasta la siguiente llamada.
+   * ¿Este punto se distingue del fondo seguro que tiene alrededor (ventana de
+   * radio `r0`)? Usa la tabla de áreas que deja `admit`. Si en la ventana no
+   * hay fondo seguro (el punto está en medio de una mancha grande), se abre al
+   * doble, y otra vez, hasta el cuadro entero: un trozo grande de pared
+   * reclamado de más se compara con la pared de más allá, y no se cuela por
+   * falta de vecinos.
    */
-  update(seed: Uint8Array, fine: Uint8Array, rgba: Uint8Array, vw: number, vh: number, w: number): Uint8Array {
+  private standsOut(x: number, y: number, r0: number, rgba: Uint8Array, vw: number, vh: number): boolean {
+    const [sr, sg, sb, sn] = this.sum!;
+    const sw = vw + 1;
+    let a = 0;
+    let bq = 0;
+    let cq = 0;
+    let d = 0;
+    let count = 0;
+    for (let r = r0; ; r *= 2) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(vw, x + r + 1);
+      const y0 = Math.max(0, y - r);
+      const y1 = Math.min(vh, y + r + 1);
+      a = y0 * sw + x0;
+      bq = y0 * sw + x1;
+      cq = y1 * sw + x0;
+      d = y1 * sw + x1;
+      count = sn[d] - sn[bq] - sn[cq] + sn[a];
+      const whole = x0 === 0 && y0 === 0 && x1 === vw && y1 === vh;
+      if (count >= Math.max(4, (x1 - x0) * (y1 - y0) * OBJECT.NEAR_MIN) || whole) break;
+    }
+    if (count < 4) return false;
+    const br = (sr[d] - sr[bq] - sr[cq] + sr[a]) / count;
+    const bg = (sg[d] - sg[bq] - sg[cq] + sg[a]) / count;
+    const bb = (sb[d] - sb[bq] - sb[cq] + sb[a]) / count;
+    const i = y * vw + x;
+    const pr = rgba[i * 4];
+    const pg = rgba[i * 4 + 1];
+    const pb = rgba[i * 4 + 2];
+    const light = pr + pg + pb;
+    const bgLight = br + bg + bb;
+    const ratio = light / Math.max(1, bgLight);
+    let tone = 0;
+    if (light >= OBJECT.TONE_MIN_LIGHT && bgLight >= OBJECT.TONE_MIN_LIGHT) {
+      tone = Math.abs(pr / light - br / bgLight) + Math.abs(pg / light - bg / bgLight) + Math.abs(pb / light - bb / bgLight);
+    }
+    return tone > OBJECT.TONE || ratio < OBJECT.DARKER || ratio > OBJECT.BRIGHTER;
+  }
+
+  /**
+   * `seed`: semillas (vw×vh, >127 = semilla). `fine`: máscara del modelo fino
+   * a resolución completa (ancho `w`). `rgba`: el cuadro a vw×vh. `you`: tus
+   * colores (piel, ropa), si se pudieron medir. Devuelve el mapa del objeto
+   * (vw×vh, 0–255); vale hasta la siguiente llamada.
+   */
+  update(seed: Uint8Array, fine: Uint8Array, rgba: Uint8Array, vw: number, vh: number, w: number, you: Tone[] = []): Uint8Array {
     const n = vw * vh;
+    this.you = you;
+    this.lastSeed = seed;
     if (this.acc?.length !== n) {
       this.acc = new Uint8Array(n);
       this.col = new Uint8Array(n * 3);
       this.ok = new Uint8Array(n);
-      this.stack = new Int32Array(n);
+      this.queue = new Int32Array(n);
+      this.depth = new Uint8Array(n);
+      const m = (vw + 1) * (vh + 1);
+      this.sum = [new Uint32Array(m), new Uint32Array(m), new Uint32Array(m), new Uint32Array(m)];
     }
     const acc = this.acc;
     const col = this.col!;
     const ok = this.admit(seed, fine, rgba, vw, vh, w);
+    this.grow(ok, fine, rgba, vw, vh, w);
     for (let y = 0; y < vh; y++) {
       for (let x = 0; x < vw; x++) {
         const i = y * vw + x;
-        if (fine[y * 2 * w + x * 2] >= 128) {
-          acc[i] = 0; // ahí estás tú
-          continue;
-        }
+        // Ahí estás tú: el recuerdo se guarda tal cual (ni se refuerza ni se
+        // borra). Si la silla sigue detrás, en cuanto te apartes su color
+        // coincide con el guardado y se reconoce al instante; si ya no está,
+        // el color no coincide y la siguiente pasada lo suelta.
+        if (fine[y * 2 * w + x * 2] >= 128) continue;
         const r = rgba[i * 4];
         const g = rgba[i * 4 + 1];
         const b = rgba[i * 4 + 2];
         const had = acc[i];
-        const same = had > 0 && Math.abs(r - col[i * 3]) + Math.abs(g - col[i * 3 + 1]) + Math.abs(b - col[i * 3 + 2]) <= OBJECT.SAME;
-        if (ok[i] === 1) {
-          // sembrado otra vez sobre lo mismo: firme; si no, candidato
-          acc[i] = same ? 255 : OBJECT.CANDIDATE;
+        const same = had > 0 && sameColor(r, g, b, col[i * 3], col[i * 3 + 1], col[i * 3 + 2]);
+        if (ok[i] === 1 || ok[i] === 3) {
+          // Sembrado (o alcanzado al crecer) por segunda vez en el mismo sitio:
+          // firme; si es la primera, candidato. No se exige el mismo color: la
+          // silla se mece contigo y sus franjas cambian de punto entre pasadas,
+          // y exigiéndolo nunca llegaba a firme mientras te movías. Lo que
+          // podía colarse así (una mano, una manga) ya no se siembra: tiene tu
+          // color.
+          acc[i] = had > 0 ? 255 : OBJECT.CANDIDATE;
           col[i * 3] = r;
           col[i * 3 + 1] = g;
           col[i * 3 + 2] = b;
@@ -493,6 +692,95 @@ export class ObjectTracker {
       }
     }
     return acc;
+  }
+
+  /**
+   * El recuerdo listo para la gráfica (RGBA, vw×vh): rgb = el color guardado
+   * del objeto en cada punto, a = qué tan firme es. Donde no hay objeto va el
+   * color del cuadro: así, al interpolar en el borde, el color del objeto se
+   * mezcla con el de su vecino de verdad y no con negro.
+   *
+   * `spread` > 0 es para BORRAR el objeto, y hace dos cosas más:
+   *
+   *   · la mancha entera: desde lo firme se alcanza todo lo que el modelo
+   *     rápido reclama pegado a ello (las semillas de la última pasada),
+   *     aunque no se hubiera admitido. Sin esto la silla se borraba a trozos:
+   *     las rejillas grises del respaldo se parecen a una camisa clara y no
+   *     entraban al recuerdo. Lo único que no se alcanza es lo que tiene tu
+   *     color de PIEL (una mano apoyada en la silla);
+   *   · el canto: lo alcanzado se ensancha `spread` puntos hacia sus vecinos.
+   *     El borde del respaldo (mitad silla, mitad pared) quedaba como un hilo
+   *     suelto; lo que alcance de pared da igual: ya era fondo.
+   *
+   * Ninguna de las dos entra donde el modelo fino te ve (`fine`, ancho `w`).
+   * Lo alcanzado lleva el color que tiene ahora. Para CONSERVAR no se hace
+   * nada de esto: dejaría un cerco de pared alrededor de la silla.
+   */
+  texture(rgba: Uint8Array, spread = 0, fine?: Uint8Array, w = 0): Uint8Array {
+    const acc = this.acc;
+    const col = this.col;
+    if (!acc || !col) return new Uint8Array(0);
+    const n = acc.length;
+    if (this.tex?.length !== n * 4) this.tex = new Uint8Array(n * 4);
+    const out = this.tex;
+    for (let i = 0; i < n; i++) {
+      const a = acc[i];
+      if (a > 0) {
+        out[i * 4] = col[i * 3];
+        out[i * 4 + 1] = col[i * 3 + 1];
+        out[i * 4 + 2] = col[i * 3 + 2];
+      } else {
+        out[i * 4] = rgba[i * 4];
+        out[i * 4 + 1] = rgba[i * 4 + 1];
+        out[i * 4 + 2] = rgba[i * 4 + 2];
+      }
+      out[i * 4 + 3] = a;
+    }
+    if (spread > 0 && fine && w > 0) {
+      const vw = w >> 1;
+      const vh = Math.floor(n / vw);
+      // 1) la mancha entera, a través de las semillas
+      const seed = this.lastSeed;
+      const queue = this.queue!;
+      if (seed && seed.length === n) {
+        const skin = this.you[0];
+        let tail = 0;
+        for (let i = 0; i < n; i++) if (acc[i] > 102 && fine[((i / vw) | 0) * 2 * w + (i % vw) * 2] < 128) queue[tail++] = i;
+        for (let head = 0; head < tail; head++) {
+          const i = queue[head];
+          const x = i % vw;
+          const y = (i / vw) | 0;
+          for (let k = 0; k < 4; k++) {
+            const nx = k === 0 ? x - 1 : k === 1 ? x + 1 : x;
+            const ny = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
+            if (nx < 0 || nx >= vw || ny < 0 || ny >= vh) continue;
+            const j = ny * vw + nx;
+            if (out[j * 4 + 3] > 102 || seed[j] <= 127 || fine[ny * 2 * w + nx * 2] >= 128 || this.likeTone(j, rgba, skin)) continue;
+            out[j * 4] = rgba[j * 4];
+            out[j * 4 + 1] = rgba[j * 4 + 1];
+            out[j * 4 + 2] = rgba[j * 4 + 2];
+            out[j * 4 + 3] = 255;
+            queue[tail++] = j;
+          }
+        }
+      }
+      // 2) el canto
+      const mark = this.depth!; // libre entre pasadas: aquí, 1 = recién alcanzado
+      for (let pass = 0; pass < spread; pass++) {
+        mark.fill(0);
+        for (let y = 0; y < vh; y++) {
+          for (let x = 0; x < vw; x++) {
+            const i = y * vw + x;
+            if (out[i * 4 + 3] > 0 || fine[y * 2 * w + x * 2] >= 128 || this.likeYou(i, rgba)) continue;
+            const near =
+              (x > 0 && out[(i - 1) * 4 + 3] > 102) || (x < vw - 1 && out[(i + 1) * 4 + 3] > 102) || (y > 0 && out[(i - vw) * 4 + 3] > 102) || (y < vh - 1 && out[(i + vw) * 4 + 3] > 102);
+            if (near) mark[i] = 1;
+          }
+        }
+        for (let i = 0; i < n; i++) if (mark[i]) out[i * 4 + 3] = 255;
+      }
+    }
+    return out;
   }
 }
 

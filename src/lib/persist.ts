@@ -9,6 +9,7 @@ import {
 } from "@/lib/audio/formats";
 import { DEFAULT_BACKGROUND, isBackgroundChoice, type BackgroundChoice } from "@/lib/video/backgrounds";
 import { DEFAULT_FX, DEFAULT_LOOK, type BackgroundLook, type VideoFx } from "@/lib/video/compositor";
+import { DEFAULT_COUNTDOWN_SECS, DEFAULT_TAKE_LIMIT, sanitizeCountdownSecs, sanitizeTakeLimit } from "@/lib/timer";
 
 const KEY = "voice-prompter:v1";
 
@@ -55,8 +56,14 @@ export type PrompterSettings = {
   fx: VideoFx;
   cue: CueGeometry;
   videoExportFormat: VideoExportFormat;
-  /** cuenta 3-2-1 antes de grabar */
+  /** cuenta atrás antes de grabar (solo cámara): encendida o no */
   countdown: boolean;
+  /** de cuántos segundos es esa cuenta: 3, 5 o 10 (ver lib/timer) */
+  countdownSecs: number;
+  /** duración de la toma en segundos; 0 = sin límite */
+  takeLimit: number;
+  /** al cumplirse la duración: detener la grabación (true) o solo avisar */
+  takeLimitStop: boolean;
   /** información para quien graba encima del video (ritmo, tiempo, avisos) */
   hud: boolean;
   /** guías de encuadre (tercios, línea de ojos) antes de grabar */
@@ -89,6 +96,9 @@ export const DEFAULT_SETTINGS: PrompterSettings = {
   cue: DEFAULT_CUE,
   videoExportFormat: DEFAULT_VIDEO_EXPORT_FORMAT,
   countdown: true,
+  countdownSecs: DEFAULT_COUNTDOWN_SECS,
+  takeLimit: DEFAULT_TAKE_LIMIT,
+  takeLimitStop: true,
   hud: true,
   guides: true,
   guideSeen: { audio: false, video: false },
@@ -125,6 +135,10 @@ export function loadPersisted(): Persisted | null {
     settings.fx = { ...DEFAULT_FX, ...(typeof settings.fx === "object" && settings.fx ? settings.fx : {}) };
     if (!["natural", "calido", "frio", "cine", "vivo", "bn"].includes(settings.fx.style)) settings.fx.style = "natural";
     settings.cue = sanitizeCue(settings.cue);
+    // temporizador: lo guardado antes de que existiera llega sin estos campos
+    settings.countdownSecs = sanitizeCountdownSecs(settings.countdownSecs);
+    settings.takeLimit = sanitizeTakeLimit(settings.takeLimit);
+    if (typeof settings.takeLimitStop !== "boolean") settings.takeLimitStop = true;
     const gs = settings.guideSeen as unknown;
     settings.guideSeen = { audio: !!(gs as { audio?: unknown })?.audio, video: !!(gs as { video?: unknown })?.video };
     return {

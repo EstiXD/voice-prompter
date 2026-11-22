@@ -19,6 +19,7 @@ import { useCompositor } from "@/hooks/useCompositor";
 import { useMediaDevices } from "@/hooks/useMediaDevices";
 import { useMicPipeline } from "@/hooks/useMicPipeline";
 import { useRecorder } from "@/hooks/useRecorder";
+import { buildVoiceChain, VOICE_TUNE } from "@/lib/audio/voice";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 import { useVoiceActivity } from "@/hooks/useVoiceActivity";
 import { useWakeLock } from "@/hooks/useWakeLock";
@@ -27,6 +28,7 @@ import { DEFAULT_SETTINGS, loadPersisted, savePersisted, type AppMode, type Prom
 import { installOnDevice, onDeviceState, type OnDeviceState } from "@/lib/speech/ondevice";
 import { pickBiasPhrases } from "@/lib/speech/phrases";
 import { detectSupport, type Support } from "@/lib/speech/support";
+import { COUNTDOWN_FOCUS_SECS, formatLimit, takeClock } from "@/lib/timer";
 import { listCustomBackgrounds, type CustomBackground } from "@/lib/video/backgrounds";
 import { preloadVision, type GazeDirection } from "@/lib/video/compositor";
 import { EDGE_TUNE } from "@/lib/video/gl";
@@ -81,6 +83,8 @@ export function PrompterApp() {
   const [lastGaze, setLastGaze] = useState<{ pct: number; tendency: GazeDirection | null } | null>(null);
   const countdownCancelRef = useRef<(() => void) | null>(null);
   const silenceWarnedRef = useRef(false);
+  const takeLimitHitRef = useRef(false);
+  const stoppingRef = useRef(false);
   const idleTimerRef = useRef<number | null>(null);
   const video = settings.mode === "video";
 
@@ -149,7 +153,7 @@ export function PrompterApp() {
   // Puente de depuración (solo dev): window.__vp.feed("texto", isFinal); lo usan las pruebas e2e
   useEffect(() => {
     if (process.env.NODE_ENV === "production") return;
-    (window as unknown as { __vp?: unknown }).__vp = { feed: alignFeed, reset: alignReset, nudge: alignNudge, store: alignStore, comp, tune: EDGE_TUNE };
+    (window as unknown as { __vp?: unknown }).__vp = { feed: alignFeed, reset: alignReset, nudge: alignNudge, store: alignStore, comp, tune: EDGE_TUNE, voice: { build: buildVoiceChain, tune: VOICE_TUNE } };
   }, [alignFeed, alignReset, alignNudge, alignStore, comp]);
 
   const speechSupported = !!support?.speech;
@@ -188,14 +192,20 @@ export function PrompterApp() {
   }, []);
 
   const runCountdown = useCallback(
-    () =>
+    (secs: number, onFocus?: () => void) =>
       new Promise<boolean>((resolve) => {
-        let n = 3;
-        setCountdown(n);
+        let n = secs;
+        // El tramo final es el de mirar al lente. En una cuenta larga lo anterior
+        // es para acomodarse: ahí la mirada todavía no sirve de referencia.
+        const show = () => {
+          setCountdown(n);
+          if (n === Math.min(secs, COUNTDOWN_FOCUS_SECS)) onFocus?.();
+        };
+        show();
         const id = window.setInterval(() => {
           n--;
           if (n > 0) {
-            setCountdown(n);
+            show();
             return;
           }
           clearInterval(id);
@@ -222,6 +232,8 @@ export function PrompterApp() {
     }
     setPhase("starting");
     silenceWarnedRef.current = false;
+    takeLimitHitRef.current = false;
+    stoppingRef.current = false;
     // Primera toma con el idioma sin descargar: se baja en segundo plano y
     // esta toma usa la nube. Va aquí porque install() exige un gesto del usuario.
     if (settings.onDevice && onDevice === "downloadable") installLang();
@@ -240,9 +252,9 @@ export function PrompterApp() {
     // y la primera palabra se reconoce sin el retraso de arranque.
     if (speechSupported) speechStart(settings.recognizeProcessed ? p.processedTrack : undefined);
     if (video && settings.countdown) {
-      // durante el 3-2-1 miras al lente: momento perfecto para calibrar la mirada
-      if (comp && (settings.fx.gazeMeter || settings.fx.eyeContact)) comp.calibrate(2600);
-      const go = await runCountdown();
+      // en los últimos segundos de la cuenta miras al lente: momento perfecto para calibrar la mirada
+      const calibrateGaze = comp && (settings.fx.gazeMeter || settings.fx.eyeContact) ? () => comp.calibrate(2600) : undefined;
+      const go = await runCountdown(settings.countdownSecs, calibrateGaze);
       if (!go) {
         speechStop();
         micStop();
@@ -304,6 +316,8 @@ export function PrompterApp() {
 
   const stopRecording = useCallback(async () => {
     if (!isLive) return;
+    // ya se está parando (a mano o sola): el temporizador de la toma no debe volver a dispararla
+    stoppingRef.current = true;
     // la cámara se apaga al terminar: guardar antes cuánto miraste a cámara
     const g = comp?.gaze;
     setLastGaze(video && settings.fx.gazeMeter && g?.calibrated ? { pct: g.onCameraPct, tendency: g.tendency } : null);
@@ -313,6 +327,27 @@ export function PrompterApp() {
     micStop();
     setPhase("finished");
   }, [isLive, speechStop, recStop, micStop, alignIdle, comp, video, settings.fx.gazeMeter]);
+
+  // ----- duración de la toma -----
+  // Al cumplirse el tiempo, una sola vez por toma: detener o avisar. El reloj del
+  // grabador no cuenta las pausas (en pausa esto ni se arma), así que el límite
+  // es de tiempo grabado. Ese reloj llega cada 200 ms: en vez de esperar al tic
+  // que ya se pasó, cada tic arma un temporizador con lo que falta y la toma se
+  // corta en su segundo. Los refs hacen falta porque el reloj sigue llegando
+  // después del aviso y mientras la grabación se cierra.
+  useEffect(() => {
+    if (phase !== "recording" || settings.takeLimit <= 0 || takeLimitHitRef.current || stoppingRef.current) return;
+    const id = window.setTimeout(
+      () => {
+        if (stoppingRef.current) return;
+        takeLimitHitRef.current = true;
+        if (settings.takeLimitStop) void stopRecording();
+        else toast.info(`Tiempo cumplido: ${formatLimit(settings.takeLimit)}`);
+      },
+      Math.max(0, settings.takeLimit * 1000 - recorder.elapsedMs),
+    );
+    return () => clearTimeout(id);
+  }, [phase, settings.takeLimit, settings.takeLimitStop, recorder.elapsedMs, stopRecording]);
 
   const newTake = useCallback(() => {
     recReset();
@@ -476,6 +511,10 @@ export function PrompterApp() {
 
   const dockPhase: DockPhase = phase === "starting" ? "starting" : phase === "recording" ? "recording" : phase === "paused" ? "paused" : "ready";
   const showDock = phase !== "edit" && phase !== "finished";
+  // El aviso del final de la toma está en el reloj del dock: en el escenario,
+  // donde el dock se esconde solo, vuelve durante los últimos segundos.
+  const take = takeClock(recorder.elapsedMs, settings.takeLimit);
+  const takeEnding = isLive && (take.phase === "ending" || take.phase === "last");
 
   return (
     <div className="flex h-dvh flex-col">
@@ -600,7 +639,9 @@ export function PrompterApp() {
           onResume={resumeRecording}
           onStop={stopRecording}
           onSilence={onSilence}
-          hidden={stage && dockHidden}
+          timer={settings}
+          onTimer={patchSettings}
+          hidden={stage && dockHidden && !takeEnding}
         />
       )}
 

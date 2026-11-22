@@ -6,7 +6,16 @@
 import type { VisionDelegate, VisionRequest, VisionResponse, VisionRole } from "@/workers/vision.worker";
 
 export type LinkState = "off" | "loading" | "ready" | "error";
-export type MaskResult = { id: number; w: number; h: number; data: Uint8Array; /** el cuadro a media resolución (RGBA), si se pidió */ pixels?: Uint8Array };
+export type MaskResult = {
+  id: number;
+  w: number;
+  h: number;
+  data: Uint8Array;
+  /** el cuadro a media resolución (RGBA), si se pidió */
+  pixels?: Uint8Array;
+  /** color medio de tu piel, tu ropa y tu pelo según el modelo fino (solo con `pixels`) */
+  tones?: { skin: number[] | null; clothes: number[] | null; hair: number[] | null };
+};
 export type FaceResult = { id: number; points: Float32Array | null; pose: Float32Array | null };
 
 const WASM_BASE = "/mediapipe";

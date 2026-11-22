@@ -41,18 +41,28 @@ type Props = {
   onCalibrate: () => void;
 };
 
-function Toggle({ id, checked, onChange, label, hint, icon, beta }: { id: string; checked: boolean; onChange: (v: boolean) => void; label: string; hint: string; icon: React.ReactNode; beta?: boolean }) {
+/** Sección del panel: título corto arriba y, a su derecha, el estado de carga si lo hay. */
+function Section({ title, aside, children }: { title: string; aside?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <div className="flex items-start gap-3 py-2.5">
-      <span className={`mt-0.5 grid h-8 w-8 flex-none place-items-center rounded-full ${checked ? "bg-amber/15 text-amber" : "bg-surface-2 text-paper-mute"}`}>{icon}</span>
+    <section className="border-t border-line py-4 first:border-t-0">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <h3 className="label">{title}</h3>
+        {aside}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function Toggle({ id, checked, onChange, label, hint, icon }: { id: string; checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string; icon: React.ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <span className={`grid h-8 w-8 flex-none place-items-center rounded-full ${checked ? "bg-amber/15 text-amber" : "bg-surface-2 text-paper-mute"}`}>{icon}</span>
       <label htmlFor={id} className="min-w-0 flex-1 cursor-pointer">
-        <span className="flex items-center gap-2 text-sm font-semibold text-paper">
-          {label}
-          {beta && <span className="chip-beta">beta</span>}
-        </span>
-        <span className="mt-0.5 block text-xs leading-snug text-paper-mute">{hint}</span>
+        <span className="block text-sm font-semibold text-paper">{label}</span>
+        {hint && <span className="mt-0.5 block text-xs leading-snug text-paper-mute">{hint}</span>}
       </label>
-      <button id={id} type="button" role="switch" aria-checked={checked} className="switch mt-1" onClick={() => onChange(!checked)} />
+      <button id={id} type="button" role="switch" aria-checked={checked} className="switch" onClick={() => onChange(!checked)} />
     </div>
   );
 }
@@ -168,20 +178,24 @@ export function LookPanel(p: Props) {
         <header className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="font-display text-xl italic">Fondo y luz</h2>
-            <p className="text-xs text-paper-mute">Lo que ves aquí es lo que se graba.</p>
+            <p className="text-xs text-paper-mute">Lo que ves es lo que se graba.</p>
           </div>
           <button type="button" className="btn btn-ghost btn-icon" onClick={p.onClose} aria-label="Cerrar">
             <IconX className="h-5 w-5" />
           </button>
         </header>
 
-        <div className="flex-1 overflow-y-auto px-5 pb-6 [scrollbar-width:thin]">
-          <section className="pt-4">
-            <div className="mb-2 flex items-center justify-between">
-              <p className="label">Fondo</p>
-              {segLoading && <span className="text-[0.7rem] text-amber-soft">Preparando el recorte…</span>}
-              {segError && <span className="text-[0.7rem] text-[#ffb3ad]">El recorte no cargó en este navegador</span>}
-            </div>
+        <div className="flex-1 overflow-y-auto px-5 pb-2 [scrollbar-width:thin]">
+          <Section
+            title="Fondo"
+            aside={
+              segLoading ? (
+                <span className="text-[0.7rem] text-amber-soft">Preparando…</span>
+              ) : segError ? (
+                <span className="text-[0.7rem] text-[#ffb3ad]">No disponible aquí</span>
+              ) : null
+            }
+          >
             <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Fondo">
               <Tile checked={is({ kind: "none" })} onClick={() => pick({ kind: "none" })} label="Original">
                 <span className="grid h-full w-full place-items-center bg-surface-3 text-paper-dim">
@@ -220,73 +234,62 @@ export function LookPanel(p: Props) {
               <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onFile} />
             </div>
             {p.background.kind === "blur" && (
-              <Amount id="bg-blur" label="Cuánto desenfoque" value={p.look.blurAmount} onChange={(v) => p.onLook({ ...p.look, blurAmount: v })} left="Suave" right="Fuerte" />
+              <Amount id="bg-blur" label="Desenfoque" value={p.look.blurAmount} onChange={(v) => p.onLook({ ...p.look, blurAmount: v })} left="Suave" right="Fuerte" />
             )}
             {(p.background.kind === "preset" || p.background.kind === "custom") && (
-              <Amount id="img-blur" label="Desenfocar la imagen" value={p.look.imageBlur} onChange={(v) => p.onLook({ ...p.look, imageBlur: v })} left="Nítida" right="Como de fondo lejano" />
+              <Amount id="img-blur" label="Desenfocar la imagen" value={p.look.imageBlur} onChange={(v) => p.onLook({ ...p.look, imageBlur: v })} left="Nítida" right="Difusa" />
             )}
             {p.background.kind !== "none" && stats?.teacher && (
-              <Toggle
-                id="fx-chair"
-                checked={!!p.fx.keepChair}
-                onChange={(v) => p.onFx({ ...p.fx, keepChair: v })}
-                label="Conservar mi silla"
-                hint="Tu silla (o lo que tengas pegado detrás) se queda contigo fija, en vez de entrar y salir del recorte. Gasta más procesador."
-                icon={<IconFace className="h-4 w-4" />}
-                beta
-              />
+              <div className="mt-1 -mb-2">
+                <Toggle
+                  id="fx-chair"
+                  checked={!!p.fx.keepChair}
+                  onChange={(v) => p.onFx({ ...p.fx, keepChair: v })}
+                  label="Conservar mi silla"
+                  hint="No se borra con el fondo."
+                  icon={<IconFace className="h-4 w-4" />}
+                />
+              </div>
             )}
-            <p className="mt-3 text-xs leading-snug text-paper-mute">
-              Tu cara y tu cuerpo siempre quedan nítidos; solo cambia lo que hay detrás. Para un borde más limpio: luz de frente y algo de espacio entre tú y la pared. Tus imágenes se guardan en este navegador.
-            </p>
-          </section>
+          </Section>
 
-          <section className="mt-4 border-t border-line pt-3">
-            <p className="label mb-1">Imagen</p>
-            <Toggle
-              id="fx-light"
-              checked={p.fx.light}
-              onChange={(v) => p.onFx({ ...p.fx, light: v })}
-              label="Luz automática"
-              hint="Mide la luz de tu cara y la deja pareja: ni oscura ni quemada."
-              icon={<IconSun className="h-4 w-4" />}
-            />
-            <Toggle
-              id="fx-key"
-              checked={p.fx.studioLight}
-              onChange={(v) => p.onFx({ ...p.fx, studioLight: v })}
-              label="Luz de estudio"
-              hint="Una luz suave y cálida sobre tu cara, como un softbox. Sigue tu cara si te mueves."
-              icon={<IconSun className="h-4 w-4" />}
-            />
-            <Toggle
-              id="fx-denoise"
-              checked={p.fx.denoise}
-              onChange={(v) => p.onFx({ ...p.fx, denoise: v })}
-              label="Quitar ruido"
-              hint="Limpia el granulado de la webcam cuando hay poca luz, sin dejar estela al moverte."
-              icon={<IconSparkle className="h-4 w-4" />}
-            />
-            <Toggle
-              id="fx-sharpen"
-              checked={p.fx.sharpen}
-              onChange={(v) => p.onFx({ ...p.fx, sharpen: v })}
-              label="Nitidez"
-              hint="Realza ojos, pelo y ropa: la imagen se ve enfocada."
-              icon={<IconEye className="h-4 w-4" />}
-            />
-            <Toggle
-              id="fx-beauty"
-              checked={p.fx.beauty}
-              onChange={(v) => p.onFx({ ...p.fx, beauty: v })}
-              label="Retoque de piel"
-              hint="Suaviza la piel sin tocar ojos, cejas ni boca."
-              icon={<IconFace className="h-4 w-4" />}
-            />
-          </section>
+          <Section title="Luz">
+            <div className="-my-2">
+              <Toggle
+                id="fx-light"
+                checked={p.fx.light}
+                onChange={(v) => p.onFx({ ...p.fx, light: v })}
+                label="Luz automática"
+                hint="Ni oscura ni quemada."
+                icon={<IconSun className="h-4 w-4" />}
+              />
+              <Toggle
+                id="fx-key"
+                checked={p.fx.studioLight}
+                onChange={(v) => p.onFx({ ...p.fx, studioLight: v })}
+                label="Luz de estudio"
+                hint="Suave y cálida sobre tu cara."
+                icon={<IconSun className="h-4 w-4" />}
+              />
+            </div>
+          </Section>
 
-          <section className="mt-2 border-t border-line pt-3">
-            <p className="label mb-2">Estilo de color</p>
+          <Section title="Imagen">
+            <div className="-my-2">
+              <Toggle
+                id="fx-denoise"
+                checked={p.fx.denoise}
+                onChange={(v) => p.onFx({ ...p.fx, denoise: v })}
+                label="Quitar ruido"
+                hint="Menos grano con poca luz."
+                icon={<IconSparkle className="h-4 w-4" />}
+              />
+              <Toggle id="fx-sharpen" checked={p.fx.sharpen} onChange={(v) => p.onFx({ ...p.fx, sharpen: v })} label="Nitidez" icon={<IconEye className="h-4 w-4" />} />
+              <Toggle id="fx-beauty" checked={p.fx.beauty} onChange={(v) => p.onFx({ ...p.fx, beauty: v })} label="Retoque de piel" icon={<IconFace className="h-4 w-4" />} />
+            </div>
+          </Section>
+
+          <Section title="Color">
             <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Estilo de color">
               {STYLES.map((st) => {
                 const on = p.fx.style === st.id;
@@ -297,57 +300,54 @@ export function LookPanel(p: Props) {
                     role="radio"
                     aria-checked={on}
                     onClick={() => p.onFx({ ...p.fx, style: st.id })}
-                    className={`flex items-center gap-2 rounded-xl border px-2.5 py-2 text-left text-xs font-semibold transition-colors ${
+                    className={`flex min-w-0 items-center gap-2 rounded-xl border px-2.5 py-2 text-left text-xs font-semibold transition-colors ${
                       on ? "border-amber/70 bg-amber/10 text-paper" : "border-line-strong bg-surface-2 text-paper-dim hover:text-paper"
                     }`}
                   >
                     <span className="h-4 w-4 flex-none rounded-full" style={{ background: st.swatch }} />
-                    {st.label}
+                    <span className="truncate">{st.label}</span>
                   </button>
                 );
               })}
             </div>
-          </section>
+          </Section>
 
-          <section className="mt-2 border-t border-line pt-3">
-            <div className="mb-1 flex items-center justify-between">
-              <p className="label">Mirada</p>
-              {faceLoading && <span className="text-[0.7rem] text-amber-soft">Cargando detector…</span>}
+          <Section title="Mirada" aside={faceLoading ? <span className="text-[0.7rem] text-amber-soft">Cargando…</span> : null}>
+            <div className="-mt-2">
+              <Toggle
+                id="fx-gaze"
+                checked={p.fx.gazeMeter}
+                onChange={(v) => p.onFx({ ...p.fx, gazeMeter: v })}
+                label="Medidor de mirada"
+                hint="Verde: parece que miras a cámara."
+                icon={<IconEye className="h-4 w-4" />}
+              />
+              <Toggle
+                id="fx-eyes"
+                checked={p.fx.eyeContact}
+                onChange={(v) => {
+                  p.onFx({ ...p.fx, eyeContact: v, gazeMeter: v ? true : p.fx.gazeMeter });
+                  if (v && !calibrated) p.onCalibrate();
+                }}
+                label="Corrección de mirada"
+                hint="Lleva tus pupilas hacia el lente."
+                icon={<IconEye className="h-4 w-4" />}
+              />
             </div>
-            <Toggle
-              id="fx-gaze"
-              checked={p.fx.gazeMeter}
-              onChange={(v) => p.onFx({ ...p.fx, gazeMeter: v })}
-              label="Medidor de mirada"
-              hint="Te dice si se nota que lees: verde = parece que miras a cámara. Tiene en cuenta el giro de tu cabeza, no solo los ojos."
-              icon={<IconEye className="h-4 w-4" />}
-              beta
-            />
-            <Toggle
-              id="fx-eyes"
-              checked={p.fx.eyeContact}
-              onChange={(v) => {
-                p.onFx({ ...p.fx, eyeContact: v, gazeMeter: v ? true : p.fx.gazeMeter });
-                if (v && !calibrated) p.onCalibrate();
-              }}
-              label="Corrección de mirada"
-              hint="Mueve levemente tus pupilas hacia la cámara en el video. Experimental: revisa que se vea natural."
-              icon={<IconEye className="h-4 w-4" />}
-              beta
-            />
             <button type="button" className="btn mt-1 w-full" onClick={p.onCalibrate}>
               <IconEye className="h-4 w-4" />
-              {calibrated ? "Volver a calibrar la mirada" : "Calibrar la mirada"}
+              {calibrated ? "Volver a calibrar" : "Calibrar la mirada"}
             </button>
-            <p className="mt-2 text-xs leading-snug text-paper-mute">
-              Calibrar: mira fijo al lente de tu cámara durante 2 segundos. Se recuerda para la próxima vez y se refresca sola en cada cuenta 3-2-1.
-            </p>
-          </section>
+            <p className="mt-2 text-center text-xs text-paper-mute">Mira fijo al lente 2 segundos.</p>
+          </Section>
 
           {stats && (
-            <p className="mt-4 text-right font-mono text-[0.68rem] text-paper-mute" title="El modo cámara se ajusta solo a lo que aguanta este equipo">
-              {stats.fps} fps · recorte {stats.model === "multi" ? "fino" : "rápido"} · calidad {QUALITY_LABEL[stats.quality]}
-            </p>
+            <details className="border-t border-line py-3">
+              <summary className="label cursor-pointer rounded select-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber">Rendimiento</summary>
+              <p className="mt-2 font-mono text-[0.68rem] text-paper-mute" title="El modo cámara se ajusta solo a lo que aguanta este equipo">
+                {stats.fps} fps · recorte {stats.model === "multi" ? "fino" : "rápido"} · calidad {QUALITY_LABEL[stats.quality]}
+              </p>
+            </details>
           )}
         </div>
       </aside>

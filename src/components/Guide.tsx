@@ -12,16 +12,16 @@ type Props = {
 
 const STEPS: Record<AppMode, [string, string][]> = {
   audio: [
-    ["Pulsa el botón ámbar", "O la barra espaciadora. El micrófono se enciende y empieza la toma."],
-    ["Lee con naturalidad", "La palabra que dices se ilumina y el texto sube solo, a tu ritmo. Si haces una pausa, te espera."],
-    ["¿Te saltaste algo?", "Sigue leyendo: el texto te vuelve a encontrar. O haz clic en la palabra por la que vas."],
-    ["Descarga", "Al detener eliges el formato: WAV, MP3, MP4… Todo pasa en tu navegador, nada se sube."],
+    ["Pulsa el botón ámbar", "O la barra espaciadora."],
+    ["Lee con naturalidad", "El texto sube a tu ritmo y te espera."],
+    ["¿Te saltaste algo?", "Sigue leyendo, o toca la palabra por la que vas."],
+    ["Descarga", "Eliges el formato al terminar; nada se sube."],
   ],
   video: [
-    ["El texto ya está bajo tu cámara", "Arrastra la tarjeta desde «Arrastra» para dejarla justo debajo del lente: así parece que miras a quien te ve."],
-    ["Elige fondo y luz", "En «Fondo y luz»: desenfoque, fondos incluidos o tu propia imagen, más luz automática y retoque de piel."],
-    ["Graba", "Pulsa el botón ámbar: cuenta 3-2-1 y lee. La palabra que dices se ilumina y el texto sube solo."],
-    ["Truco para que no se note", "Deja la tarjeta angosta (2–3 líneas) y pegada al lente. El medidor de mirada (beta) te dice si se nota."],
+    ["El texto ya está bajo tu cámara", "Arrastra la tarjeta hasta pegarla al lente."],
+    ["Elige fondo y luz", "Desenfoque, fondos, luz y retoque de piel."],
+    ["Graba", "Pulsa el botón ámbar y lee: el texto sube solo."],
+    ["Truco para que no se note", "Tarjeta angosta y pegada al lente."],
   ],
 };
 

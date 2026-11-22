@@ -8,7 +8,7 @@
 // que una detección de cara no retrase el recorte del cuadro siguiente.
 
 import { FaceLandmarker, FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
-import { MaskCleaner, toBytes } from "@/lib/video/mask";
+import { classTone, MaskCleaner, toBytes } from "@/lib/video/mask";
 
 export type VisionRole = "seg" | "face";
 export type VisionDelegate = "GPU" | "CPU";
@@ -20,7 +20,7 @@ export type VisionRequest =
 
 export type VisionResponse =
   | { type: "ready"; gen: number; model: string; delegate: VisionDelegate }
-  | { type: "mask"; id: number; w: number; h: number; data: Uint8Array; ms: number; pixels?: Uint8Array }
+  | { type: "mask"; id: number; w: number; h: number; data: Uint8Array; ms: number; pixels?: Uint8Array; tones?: { skin: number[] | null; clothes: number[] | null; hair: number[] | null } }
   /**
    * puntos de la cara normalizados (x, y por punto) o null si no hay cara;
    * `pose`: matriz 4×4 (por columnas) de la cabeza en el espacio de la cámara
@@ -127,16 +127,27 @@ function runSeg(id: number, ts: number, bitmap: ImageBitmap, wantPixels: boolean
     const m = masks[0];
     const { width: w, height: h } = m;
     const out = new Uint8Array(w * h);
+    let tones: { skin: number[] | null; clothes: number[] | null; hair: number[] | null } | undefined;
     if (masks.length >= 6) {
       // multiclase: [fondo, pelo, piel cuerpo, piel cara, ropa, otros]
       toBytes(cleaner.personFromClasses(m.getAsFloat32Array(), masks[5].getAsFloat32Array(), masks[1].getAsFloat32Array(), masks[3].getAsFloat32Array(), w, h), out);
+      // tus colores (piel, ropa y pelo), para que quien recuerda objetos no tome por silla una mano ni te borre el pelo
+      const vw = w >> 1;
+      const vh = h >> 1;
+      if (pixels && pixels.length === vw * vh * 4) {
+        tones = {
+          skin: classTone(masks[3].getAsFloat32Array(), w, pixels, vw, vh, masks[2].getAsFloat32Array()),
+          clothes: classTone(masks[4].getAsFloat32Array(), w, pixels, vw, vh),
+          hair: classTone(masks[1].getAsFloat32Array(), w, pixels, vw, vh),
+        };
+      }
     } else if (masks.length > 1) {
       toBytes(m.getAsFloat32Array(), out, true); // el primer canal es "fondo"
     } else {
       toBytes(m.getAsFloat32Array(), out);
     }
     sent = true;
-    scope.postMessage({ type: "mask", id, w, h, data: out, ms: performance.now() - t0, pixels }, pixels ? [out.buffer, pixels.buffer] : [out.buffer]);
+    scope.postMessage({ type: "mask", id, w, h, data: out, ms: performance.now() - t0, pixels, tones }, pixels ? [out.buffer, pixels.buffer] : [out.buffer]);
   });
   // sin máscara hay que contestar igual: el hilo principal espera para mandar el siguiente
   if (!sent) scope.postMessage({ type: "mask", id, w: 0, h: 0, data: new Uint8Array(0), ms: performance.now() - t0 });

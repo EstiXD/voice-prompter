@@ -42,25 +42,61 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
  * comprobar que cada punto sigue viéndose igual.
  */
 const TEACH_GLSL = `
-uniform sampler2D uVeto;
-uniform sampler2D uRef;
+uniform sampler2D uVeto;    // el objeto pegado a ti: rgb = su color en cada punto · a = qué tan firme es el recuerdo
 uniform vec2 uRefOff;
 uniform float uVetoOn;
+uniform float uObjKeep;
+uniform vec4 uHead;         // tu cabeza (centro y radios, en coordenadas de imagen 0–1); radios 0 = no se sabe
+uniform vec4 uHair;         // el color de tu pelo; a = 0 si no se pudo medir
+uniform vec4 uSkin;         // el de tu piel y el de tu ropa, igual
+uniform vec4 uClothes;
 
 /**
- * ¿Este punto se ve como cuando lo miró el modelo fino? 1 = igual; 0 = cambió
- * (te moviste encima, pasaste una mano por delante). Se compara con la
- * referencia en el punto y en sus vecinos: una silla que se mece unos píxeles
- * contigo sigue siendo la misma silla.
+ * ¿Este punto se ve como el objeto recordado ahí? 1 = igual; 0 = otra cosa
+ * (estás tú delante, pasó una mano). Se compara con el color guardado en el
+ * punto y en sus vecinos: una silla que se mece unos píxeles contigo sigue
+ * siendo la misma silla. Al comparar con el color del objeto, y no con una
+ * foto del momento, la silla que tapabas se reconoce en cuanto te apartas.
  */
+float likeObj(vec3 cur, vec3 ref) {
+  float lc = cur.r + cur.g + cur.b;
+  float lr = ref.r + ref.g + ref.b;
+  // Por TONO (proporciones de rojo, verde y azul) y con una luz parecida: el
+  // naranja de un respaldo cambia mucho de brillo con tu sombra, y la piel de
+  // una mano que pasa por delante queda cerca de él si se mide a secas, pero
+  // lejos en tono.
+  vec3 d = abs(cur / max(lc, 1e-3) - ref / max(lr, 1e-3));
+  float tone = 1.0 - smoothstep(0.07, 0.13, d.r + d.g + d.b);
+  float ratio = lc / max(lr, 1e-3);
+  float light = smoothstep(0.55, 0.7, ratio) * (1.0 - smoothstep(1.45, 1.8, ratio));
+  // en lo oscuro (un respaldo negro) el tono es ruido: ahí vale la diferencia a secas
+  float dark = 1.0 - smoothstep(0.3, 0.5, max(lc, lr));
+  float plain = 1.0 - smoothstep(0.13, 0.30, length(cur - ref));
+  return mix(tone * light, plain, dark);
+}
+
+/** ¿Este punto tiene uno de tus colores (piel, ropa)? Como likeObj, pero con más margen de luz: tu sombra, tu palma. */
+float likeTone(vec3 cur, vec4 ref) {
+  if (ref.a < 0.5) return 0.0;
+  float lc = cur.r + cur.g + cur.b;
+  float lr = ref.r + ref.g + ref.b;
+  vec3 d = abs(cur / max(lc, 1e-3) - ref.rgb / max(lr, 1e-3));
+  float tone = 1.0 - smoothstep(0.06, 0.1, d.r + d.g + d.b);
+  float ratio = lc / max(lr, 1e-3);
+  float light = smoothstep(0.4, 0.55, ratio) * (1.0 - smoothstep(1.7, 2.0, ratio));
+  float dark = 1.0 - smoothstep(0.3, 0.5, max(lc, lr));
+  float plain = 1.0 - smoothstep(0.13, 0.30, length(cur - ref.rgb));
+  return mix(tone * light, plain, dark);
+}
+
 float sameAsRef(vec3 cur, vec2 uv) {
-  vec2 t = uRefOff * 4.0; // un píxel de la referencia
-  float d = length(cur - texture(uRef, uv).rgb);
-  d = min(d, length(cur - texture(uRef, uv + vec2(t.x, 0.0)).rgb));
-  d = min(d, length(cur - texture(uRef, uv - vec2(t.x, 0.0)).rgb));
-  d = min(d, length(cur - texture(uRef, uv + vec2(0.0, t.y)).rgb));
-  d = min(d, length(cur - texture(uRef, uv - vec2(0.0, t.y)).rgb));
-  return 1.0 - smoothstep(0.13, 0.30, d);
+  vec2 t = uRefOff * 4.0; // un píxel del mapa
+  float s = likeObj(cur, texture(uVeto, uv).rgb);
+  s = max(s, likeObj(cur, texture(uVeto, uv + vec2(t.x, 0.0)).rgb));
+  s = max(s, likeObj(cur, texture(uVeto, uv - vec2(t.x, 0.0)).rgb));
+  s = max(s, likeObj(cur, texture(uVeto, uv + vec2(0.0, t.y)).rgb));
+  s = max(s, likeObj(cur, texture(uVeto, uv - vec2(0.0, t.y)).rgb));
+  return s;
 }
 `;
 
@@ -88,8 +124,33 @@ void main() {
   if (uVetoOn > 0.0) {
     // entero mientras el recuerdo sea firme; al aflojarse (lleva muchas
     // pasadas sin que nadie lo reclame) se va de una vez, no a medias
-    float obj = smoothstep(0.25, 0.4, texture(uVeto, vUv).r);
-    if (obj > 0.02) p = max(p, obj * sameAsRef(c, vUv) * uVetoOn);
+    float obj = smoothstep(0.25, 0.4, texture(uVeto, vUv).a) * uVetoOn;
+    if (obj > 0.02) {
+      // ¿se ve como la silla que había en este punto?
+      float same = sameAsRef(c, vUv);
+      // "Conservar mi silla": encendido cuenta como tuyo; apagado, como fondo
+      // (el modelo rápido la toma por persona, y sola no se iría nunca)
+      if (uObjKeep > 0.5) {
+        p = max(p, obj * same);
+      } else {
+        // Al borrar, en la zona de la silla se va todo MENOS lo que eres tú.
+        // Exigir que cada punto coincidiera con el recuerdo dejaba pedazos: la
+        // silla se mece contigo y sus franjas cambian de sitio. Tú eres lo que
+        // tiene tu color de piel o de ropa y no es lo que había ahí (una
+        // rejilla gris del respaldo se parece a una camisa clara, pero es
+        // justo lo que había).
+        float you = max(likeTone(c, uSkin), likeTone(c, uClothes)) * (1.0 - same);
+        // Dentro de tu cabeza, al revés: solo se va lo que es la silla de ahí
+        // y no tiene el color de tu pelo. Un pelo negro delante de un respaldo
+        // negro es igual que el recuerdo, y borrarlo abría un hueco en el pelo.
+        if (uHead.z > 0.0) {
+          float inHead = 1.0 - smoothstep(0.92, 1.12, length((vUv - uHead.xy) / uHead.zw));
+          float hairLike = uHair.a > 0.5 ? 1.0 - smoothstep(0.12, 0.26, length(c - uHair.rgb)) : 1.0;
+          you = mix(you, 1.0 - same * (1.0 - hairLike), inHead);
+        }
+        p = min(p, 1.0 - obj * (1.0 - you));
+      }
+    }
   }
   o = vec4(I, p, I * p, I * I);
 }`;
@@ -620,7 +681,7 @@ export const EDGE_TUNE = {
 const TIME_ELAPSED_EXT = 0x88bf;
 const GPU_DISJOINT_EXT = 0x8fbb;
 
-/** Cuadro de referencia del veto (ver `snapshotRef`). */
+/** Tamaño del mapa del objeto pegado a ti (ver `setTeach`). */
 const REF_W = 256;
 const REF_H = 144;
 /** un veto sin renovar se apaga solo: de 6 a 8 s */
@@ -727,9 +788,15 @@ export class GlRenderer {
   gpuMs = 0;
   // veto del modelo fino: mapa + el cuadro con el que se calculó
   private readonly veto: WebGLTexture;
-  private readonly ref: [Target, Target];
-  private refCur = 0;
   private vetoSize = { w: 0, h: 0 };
+  private objKeep = false;
+  /** tu cabeza: centro y radios en coordenadas de imagen 0–1 (radios 0 = no se sabe) */
+  private head: [number, number, number, number] = [0, 0, 0, 0];
+  /** el color de tu pelo (0–1) y si se conoce */
+  private hair: [number, number, number, number] = [0, 0, 0, 0];
+  /** los de tu piel y tu ropa, igual */
+  private skin: [number, number, number, number] = [0, 0, 0, 0];
+  private clothes: [number, number, number, number] = [0, 0, 0, 0];
   /** cuándo llegó el último veto (performance.now); 0 = no hay */
   private vetoAt = 0;
 
@@ -799,7 +866,6 @@ export class GlRenderer {
     }
     this.probe = this.target(PROBE_W, PROBE_H, gl.RGBA8);
     this.veto = this.texture(true);
-    this.ref = [this.target(REF_W, REF_H, gl.RGBA8), this.target(REF_W, REF_H, gl.RGBA8)];
     const pbo = gl.createBuffer();
     if (!pbo) throw new Error("sin búfer de lectura");
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
@@ -945,41 +1011,45 @@ export class GlRenderer {
   }
 
   /**
-   * Guarda una copia chica del cuadro subido: el que está viendo ahora el
-   * modelo fino. Cuando llegue su veto (`setVeto`) esta copia pasa a ser la
-   * referencia de "así se veía lo que no era persona".
+   * Mapa del objeto pegado a ti (RGBA, w×h): rgb = el color del objeto en cada
+   * punto, a = qué tan firme es el recuerdo (ver ObjectTracker.texture).
    */
-  snapshotRef(): void {
-    if (!this.hasFrame) return;
-    const gl = this.gl;
-    const cp = this.progs.copy;
-    gl.bindVertexArray(this.vao);
-    gl.disable(gl.BLEND);
-    gl.useProgram(cp.p);
-    this.bindTex(0, this.video, cp.u.uVideo);
-    gl.uniform2f(cp.u.uOff ?? null, 0.25 / REF_W, 0.25 / REF_H);
-    this.draw(this.ref[1 - this.refCur], cp);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
-  /** Mapa del objeto pegado a ti (0–255) que el modelo fino calculó sobre el cuadro de la última `snapshotRef`. */
   setTeach(data: Uint8Array, w: number, h: number): void {
     const gl = this.gl;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.veto);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     if (w !== this.vetoSize.w || h !== this.vetoSize.h) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, data);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
       this.vetoSize = { w, h };
     } else {
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RED, gl.UNSIGNED_BYTE, data);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
     }
-    this.refCur = 1 - this.refCur;
     this.vetoAt = performance.now();
+  }
+
+  /**
+   * Dónde está tu cabeza ahora (centro y radios en coordenadas de imagen 0–1;
+   * radios 0 = no se sabe) y de qué color es tu pelo (RGB 0–255), si se midió.
+   */
+  setHead(cx: number, cy: number, rx: number, ry: number, hair?: readonly number[] | null): void {
+    this.head = [cx, cy, rx, ry];
+    this.hair = hair ? [hair[0] / 255, hair[1] / 255, hair[2] / 255, 1] : [0, 0, 0, 0];
   }
 
   clearVeto(): void {
     this.vetoAt = 0;
+  }
+
+  /** Tus colores (RGB 0–255, o nada si no se midieron): lo que los tiene no se borra con la silla. */
+  setYou(skin?: readonly number[] | null, clothes?: readonly number[] | null): void {
+    this.skin = skin ? [skin[0] / 255, skin[1] / 255, skin[2] / 255, 1] : [0, 0, 0, 0];
+    this.clothes = clothes ? [clothes[0] / 255, clothes[1] / 255, clothes[2] / 255, 1] : [0, 0, 0, 0];
+  }
+
+  /** Qué se hace con el objeto pegado a ti: conservarlo contigo (true) o borrarlo con el fondo (false). */
+  setObjectMode(keep: boolean): void {
+    this.objKeep = keep;
   }
 
   /** Cuánto pesa el veto ahora mismo (0–1): se desvanece si deja de renovarse. */
@@ -993,10 +1063,14 @@ export class GlRenderer {
     const gl = this.gl;
     const on = this.vetoStrength();
     gl.uniform1f(pr.u.uVetoOn ?? null, on);
+    gl.uniform1f(pr.u.uObjKeep ?? null, this.objKeep ? 1 : 0);
     // siempre con textura válida en sus unidades, aunque esté apagado
     this.bindTex(3, on > 0 ? this.veto : this.mask, pr.u.uVeto);
-    this.bindTex(4, this.ref[this.refCur].tex, pr.u.uRef);
     gl.uniform2f(pr.u.uRefOff ?? null, 0.25 / REF_W, 0.25 / REF_H);
+    gl.uniform4f(pr.u.uHead ?? null, this.head[0], this.head[1], this.head[2], this.head[3]);
+    gl.uniform4f(pr.u.uHair ?? null, this.hair[0], this.hair[1], this.hair[2], this.hair[3]);
+    gl.uniform4f(pr.u.uSkin ?? null, this.skin[0], this.skin[1], this.skin[2], this.skin[3]);
+    gl.uniform4f(pr.u.uClothes ?? null, this.clothes[0], this.clothes[1], this.clothes[2], this.clothes[3]);
   }
 
   get hasMask(): boolean {

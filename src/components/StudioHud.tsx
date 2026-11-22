@@ -83,26 +83,26 @@ export function StudioHud({ script, store, analyser, comp, live, session, mirror
       // encuadre y luz (modo cámara)
       if (comp) {
         const f = comp.framing;
-        if (!f.face) tips.push({ id: "face", text: "No veo tu cara: ponte frente a la cámara", tone: "warn" });
+        if (!f.face) tips.push({ id: "face", text: "No veo tu cara", tone: "warn" });
         else {
-          if (f.lowLight) tips.push({ id: "light", text: "Poca luz en tu cara: pon una lámpara o ventana frente a ti", tone: "warn" });
+          if (f.lowLight) tips.push({ id: "light", text: "Poca luz en tu cara", tone: "warn" });
           // en pantalla (con espejo la imagen va invertida)
           const sx = mirror ? 1 - f.cx : f.cx;
-          if (sx < 0.32) tips.push({ id: "center", text: "Céntrate en el cuadro →", tone: "info" });
-          else if (sx > 0.68) tips.push({ id: "center", text: "← Céntrate en el cuadro", tone: "info" });
-          if (f.size < 0.2) tips.push({ id: "size", text: "Acércate un poco a la cámara", tone: "info" });
-          else if (f.size > 0.62) tips.push({ id: "size", text: "Aléjate un poco de la cámara", tone: "info" });
-          if (f.cy > 0.6) tips.push({ id: "head", text: "Sube la cámara o baja la silla: tus ojos deben quedar en el tercio de arriba", tone: "info" });
+          if (sx < 0.32) tips.push({ id: "center", text: "Céntrate →", tone: "info" });
+          else if (sx > 0.68) tips.push({ id: "center", text: "← Céntrate", tone: "info" });
+          if (f.size < 0.2) tips.push({ id: "size", text: "Acércate a la cámara", tone: "info" });
+          else if (f.size > 0.62) tips.push({ id: "size", text: "Aléjate de la cámara", tone: "info" });
+          if (f.cy > 0.6) tips.push({ id: "head", text: "Estás muy abajo en el cuadro", tone: "info" });
         }
         // mirada (grabando): solo si llevas varios segundos casi sin mirar al lente
         const lately = comp.gaze.lately;
         if (live && lately.offShare >= 0.6) {
           const text =
             lately.tendency === "abajo"
-              ? "Se nota que lees: sube la tarjeta hasta pegarla al lente"
+              ? "Se nota que lees: sube la tarjeta"
               : lately.tendency === "derecha" || lately.tendency === "izquierda"
-                ? "Se nota que lees: haz la tarjeta más angosta y céntrala bajo el lente"
-                : "Se nota que lees: vuelve al lente entre frase y frase";
+                ? "Se nota que lees: tarjeta más angosta"
+                : "Se nota que lees: mira al lente";
           tips.push({ id: "gaze", text, tone: "info" });
         }
       }
@@ -112,7 +112,7 @@ export function StudioHud({ script, store, analyser, comp, live, session, mirror
         const clips = lv.filter((x) => x.peak > 0.985).length;
         const voiced = lv.filter((x) => x.db > -55);
         const avg = voiced.length ? voiced.reduce((a, x) => a + x.db, 0) / voiced.length : -99;
-        if (clips >= 3) tips.push({ id: "clip", text: "El micrófono satura: habla un poco más lejos", tone: "warn" });
+        if (clips >= 3) tips.push({ id: "clip", text: "El micrófono satura: habla más lejos", tone: "warn" });
         else if (voiced.length > lv.length * 0.3 && avg < -38) tips.push({ id: "low", text: "Te oigo bajo: acércate al micrófono", tone: "info" });
       }
 
@@ -148,7 +148,7 @@ export function StudioHud({ script, store, analyser, comp, live, session, mirror
           </span>
         )}
         {session && view.wpm > 0 && (
-          <span className={`hud-chip hud-pace ${paceTone}`} title="Palabras por minuto en los últimos segundos">
+          <span className={`hud-chip hud-pace ${paceTone}`} title="Palabras por minuto">
             <b>{view.wpm}</b> ppm · {paceLabel}
           </span>
         )}

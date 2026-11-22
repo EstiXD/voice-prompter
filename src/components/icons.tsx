@@ -165,6 +165,15 @@ export const IconCamera = (p: IconProps) => (
   </svg>
 );
 
+export const IconTimer = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="13.5" r="7.5" />
+    <path d="M12 13.5v-4" />
+    <path d="M9.5 2.5h5" />
+    <path d="M12 2.5V6" />
+  </svg>
+);
+
 export const IconEye = (p: IconProps) => (
   <svg {...base(p)}>
     <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" />

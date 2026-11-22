@@ -7,8 +7,8 @@ lees, la palabra que dices se ilumina y el texto avanza solo. Dos modos:
   siempre activa; descargas en **WAV, MP3, MP4 (AAC), FLAC, OGG o el original**.
 - **Cámara**: video con el texto en una tarjeta **arrastrable junto a la
   cámara** (para que parezca que miras al lente), fondos tipo Meet
-  (desenfoque, 6 incluidos o tu imagen), luz automática, retoque de piel y,
-  en beta, medidor y corrección de mirada. Descarga en **MP4 (H.264 + AAC)**,
+  (desenfoque, 6 incluidos o tu imagen), luz automática, retoque de piel,
+  medidor y corrección de mirada. Descarga en **MP4 (H.264 + AAC)**,
   WebM o solo la voz. El texto nunca sale en el video.
 
 Sin cuenta, sin backend: todo ocurre en el navegador.
@@ -30,9 +30,9 @@ cursor; lo demás se muestra como estructura y el reconocedor lo ignora.
 ## Cómo funciona
 
 ```
-micrófono → [RNNoise wasm] → pasa-altos → compresor → limitador ─┬─ MediaRecorder (WebM/Opus) → conversión en el navegador
-                                                                │     (mediabunny + WebCodecs/WASM) → wav · mp3 · mp4 · flac · ogg
-                                                                └─ Web Speech API (Chrome 139+ recibe el audio ya limpio)
+micrófono → [RNNoise wasm] → cadena de voz (ecualización, aire, compresor, limitador, techo) ─┬─ MediaRecorder (WebM/Opus) → conversión en el navegador
+                                                                                              │     (mediabunny + WebCodecs/WASM) → wav · mp3 · mp4 · flac · ogg
+                                                                                              └─ Web Speech API (Chrome 139+ recibe el audio ya limpio)
 Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → alineador difuso (src/lib/align) → palabra actual + auto-scroll
 ```
 
@@ -49,6 +49,27 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   `@sapphi-red/web-noise-suppressor` (worklet + wasm copiados a
   `public/worklets/` en `postinstall`). Si RNNoise no carga, se degrada a la
   supresión nativa del navegador.
+- **Cadena de voz** (`src/lib/audio/voice.ts`, con tests): solo nodos nativos
+  de Web Audio, así corre igual en vivo y en un `OfflineAudioContext` (se
+  ajustó pasando tomas reales por ella y midiendo con EBU R128). Midiendo
+  tomas de un micrófono de portátil contra el espectro medio de la voz
+  hablada: sobraban 6–9 dB entre 200 y 315 Hz, faltaban 5–8 dB entre 630 y
+  1250 Hz y sobraban 4–11 dB entre 4 y 6,3 kHz; la ecualización corrige más
+  o menos la mitad. **Aire**: con una voz real RNNoise no deja nada por
+  encima de 8 kHz (voz "de teléfono"); esos agudos se toman del micrófono sin
+  limpiar, retrasados lo que tarda RNNoise (991 muestras), y una puerta los
+  abre solo en eses y consonantes (abrirla en las vocales dejaba más siseo
+  que voz). Después, compresor, nivel para quedar sobre −16 LUFS, limitador
+  y un **techo** que redondea los picos a −1 dBFS: el limitador del
+  navegador solo dejaba pasar picos por encima de 0 dBFS. Ojo: en Web Audio
+  la Q de pasa-altos y pasa-bajos va en decibelios.
+- **Temporizador** (`src/lib/timer.ts`, con tests; botón del reloj en el
+  dock): cuenta antes de grabar de 3, 5 o 10 s (en las largas, los primeros
+  segundos son para acomodarse y la mirada se calibra en los últimos 3) y
+  duración de la toma (de 0:30 a 10:00). Con duración, el reloj muestra
+  transcurrido / total, avisa en ámbar a 10 s del final y en rojo a 3, y al
+  cumplirse la toma se detiene sola (o solo avisa, según el interruptor). El
+  tiempo en pausa no cuenta.
 - **Seguimiento rápido**: reconocimiento en el dispositivo cuando Chrome lo
   ofrece (`src/lib/speech/ondevice.ts`), reinicio sin hueco del reconocedor,
   un **predictor** (`src/lib/align/predictor.ts`) que adelanta el resaltado a
@@ -99,20 +120,46 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   de segundo después de parar para que termine de asentarse. Donde el modelo
   duda (confianza cerca de 0,5) la máscara anterior pesa aún más: la idea del
   suavizado de MediaPipe.
-- **Conservar mi silla (beta, apagado)**: en "Fondo y luz", solo en equipos de
-  escritorio con núcleos de sobra. El modelo fino corre cada 1–3 s en otro
-  worker y, de lo que el rápido reclama sin ser persona, recuerda las manchas
-  cuyo color no aparece lejos de ellas (`ObjectTracker` en `mask.ts`, con
-  tests). Mejora mucho una silla de colores vivos, pero puede quedarse con
-  otro objeto cercano de color único, y cada pasada cuesta medio segundo de
-  un núcleo. Lo que NO funciona, para no repetirlo: usar esas zonas para
-  vetar la silla abre huecos en las manos que pasan por delante.
+- **Conservar mi silla** (en "Fondo y luz", solo en equipos de escritorio con
+  núcleos de sobra): encendido, la silla se queda contigo entera y firme;
+  apagado, se borra con el fondo. El modelo rápido toma el respaldo por
+  persona, así que para cualquiera de las dos cosas hay que saber qué es
+  silla. El modelo fino corre cada 1–3 s en otro worker (quieto y con la
+  silueta cambiada, hasta una vez por segundo; mientras gesticulas, cada 3 s:
+  le quitaba procesador al rápido justo entonces) y `ObjectTracker`
+  (`mask.ts`, con tests) recuerda como objeto lo que el rápido reclama sin
+  ser persona, siempre que NO se vea como el fondo que tiene al lado (otro
+  tono, o mucho más oscuro o claro) y NO tenga tu color de piel ni de ropa
+  (los colores medios de lo que el modelo fino sí etiquetó como piel y ropa:
+  una mano levantada que se le escapa no es una silla). Con dos pasadas en el
+  mismo sitio queda firme, y desde ahí crece hacia lo que toca y tiene los
+  colores de la silla, con tope de distancia. El recuerdo guarda el color de
+  cada punto y se conserva mientras lo tapas: al apartarte, la silla se
+  reconoce al instante.
+  - Para **borrar**, la zona se amplía a toda la mancha que el modelo rápido
+    reclama pegada a lo ya reconocido (menos lo que tiene tu color de piel) y
+    se ensancha unos puntos; dentro de ella se va todo salvo lo que tiene tu
+    color de piel o de ropa y no es lo que había ahí. Dentro de tu cabeza
+    solo se va lo que es la silla de ahí y no tiene el color de tu pelo.
+  - Límite conocido: lo que el propio modelo fino confunde contigo (un
+    respaldo negro pegado a un pelo negro) no se puede borrar: se queda.
+  - Lo que NO funciona, para no repetirlo: (1) vetar con lo que el rápido
+    reclama y el fino no, sin más: abre huecos en las manos que pasan por
+    delante; (2) admitir por "color raro en el resto del cuadro": un
+    respaldo negro no entra y sí la pared de junto a una mano; (3) aprender
+    colores de lo que se siembra una sola vez o crecer sin comparar con el
+    fondo: la palma de una mano y una pared crema se parecen y se lleva la
+    pared; (4) exigir el mismo color de una pasada a otra, o comparar por
+    diferencia a secas: el naranja de un respaldo cambia de brillo con tu
+    sombra y la silla se mece contigo, así que nunca quedaba firme (se
+    compara por tono); (5) al borrar, exigir que cada punto coincida con el
+    recuerdo: deja la silla a pedazos.
 - **Alineación** (`src/lib/align/aligner.ts`): alineación de secuencias con
   pesos (programación dinámica) de todo lo dicho contra una ventana del
   guion: las palabras funcionales ("y", "de") casi no pesan, saltarse
   palabras cuesta, y un salto solo gana con varias palabras que lo
   confirman; los saltos se avisan en pantalla con opción de volver.
-- **Medidor de mirada (beta)** (`src/lib/video/face.ts`, con tests): la
+- **Medidor de mirada** (`src/lib/video/face.ts`, con tests): la
   mirada respecto al lente es la posición del iris dentro del ojo MÁS hacia
   dónde apunta la cabeza (matriz de pose de Face Landmarker) y dónde queda el
   lente desde tu sitio. Sin eso, girar la cabeza 6° sin dejar de mirar al
@@ -124,7 +171,7 @@ Markdown ligero → tokens leíbles → Web Speech (interinos + finales) → ali
   segundos fuera y consejo al terminar la toma). La calibración se descarta
   si no miraste fijo, se recuerda entre sesiones (`voice-prompter:gaze:v1`) y
   se refresca en cada cuenta 3-2-1.
-- **Corrección de mirada (beta)**: iris trasladado rígido dentro del ojo,
+- **Corrección de mirada**: iris trasladado rígido dentro del ojo,
   párpados que acompañan el movimiento vertical (≈62 % el superior, 25 % el
   inferior); se desvanece al parpadear, al girar la cabeza, al mirar lejos a
   propósito (umbrales inspirados en NVIDIA Maxine e Intel ECC-Net) y cuando

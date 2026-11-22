@@ -27,12 +27,12 @@ type Props = {
 
 /** Qué hacer la próxima toma, según cuánto y hacia dónde se fue la mirada. */
 function gazeAdvice(pct: number, tendency: GazeDirection | null): string {
-  if (pct >= 75) return "Miraste a cámara casi todo el tiempo: no se nota que lees.";
-  const lead = pct >= 50 ? "Se nota un poco que lees." : "Se nota que lees.";
-  if (tendency === "abajo") return `${lead} Tu mirada caía por debajo del lente: sube la tarjeta hasta pegarla a la cámara y déjala en 2–3 líneas.`;
-  if (tendency === "arriba") return `${lead} Tu mirada se iba por encima del lente: baja un poco la tarjeta, o vuelve a calibrar mirando fijo al lente.`;
-  if (tendency === "derecha" || tendency === "izquierda") return `${lead} Tu mirada barría de lado a lado: haz la tarjeta más angosta y céntrala bajo el lente.`;
-  return pct >= 50 ? `${lead} Acerca la tarjeta al lente y hazla más angosta.` : `${lead} Pon la tarjeta pegada al lente, angosta (2–3 líneas) y la letra un poco más grande.`;
+  if (pct >= 75) return "No se nota que lees.";
+  const lead = pct >= 50 ? "Se nota un poco que lees" : "Se nota que lees";
+  if (tendency === "abajo") return `${lead}: sube la tarjeta al lente.`;
+  if (tendency === "arriba") return `${lead}: baja un poco la tarjeta.`;
+  if (tendency === "derecha" || tendency === "izquierda") return `${lead}: haz la tarjeta más angosta.`;
+  return `${lead}: acerca la tarjeta al lente.`;
 }
 
 export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null, gazeTendency = null, format, onFormat, videoFormat, onVideoFormat, onNewTake, onEdit }: Props) {
@@ -111,7 +111,7 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
 
         {recording ? (
           <>
-            <dl className={`mt-5 grid gap-3 text-center ${gazePct !== null ? "grid-cols-4" : "grid-cols-3"}`}>
+            <dl className={`mt-5 grid gap-2 text-center sm:gap-3 ${gazePct !== null ? "grid-cols-2 sm:grid-cols-4" : "grid-cols-3"}`}>
               {[
                 ["Duración", formatDuration(recording.durationMs)],
                 ["Tamaño", formatBytes(recording.blob.size)],
@@ -125,9 +125,11 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
               ))}
             </dl>
             {gazePct !== null && <p className="mt-2 text-center text-xs text-paper-dim">{gazeAdvice(gazePct, gazeTendency)}</p>}
-            <p className="mt-2 text-center text-xs text-paper-mute">
-              {wordsRead > 0 ? `${wordsRead} de ${wordsTotal} palabras · grabado en ${recording.label}` : `Grabado en ${recording.label}`}
-            </p>
+            {wordsRead > 0 && (
+              <p className="mt-2 text-center text-xs text-paper-mute">
+                {wordsRead} de {wordsTotal} palabras
+              </p>
+            )}
 
             {isVideo ? (
               <video className="mt-5 aspect-video w-full rounded-xl border border-line bg-black" controls playsInline preload="metadata" src={recording.url} />
@@ -136,7 +138,7 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
             )}
 
             <fieldset className="mt-5">
-              <legend className="label mb-2">Formato de descarga</legend>
+              <legend className="label mb-2">Formato</legend>
               <div className={`grid grid-cols-2 gap-2 ${isVideo ? "" : "sm:grid-cols-3"}`} role="radiogroup" aria-label="Formato de descarga">
                 {options.map((o) => {
                   const on = active === o.value;
@@ -174,15 +176,13 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
               )}
               <IconDownload className="relative h-4 w-4" />
               <span className="relative">
-                {busy ? `Convirtiendo a ${info.label}… ${Math.round(progress * 100)}%` : `Descargar .${ext}`}
+                {busy ? `Convirtiendo… ${Math.round(progress * 100)}%` : `Descargar .${ext}`}
               </span>
             </button>
-            <p className="mt-2 text-center text-[0.7rem] text-paper-mute">
-              La conversión ocurre en tu navegador; nada se sube a ningún servidor.
-            </p>
+            <p className="mt-2 text-center text-[0.7rem] text-paper-mute">Nada se sube: todo queda en tu navegador.</p>
           </>
         ) : (
-          <p className="mt-4 text-sm text-paper-dim">La grabación quedó vacía. Revisa el micrófono{isVideo ? " y la cámara" : ""} e inténtalo de nuevo.</p>
+          <p className="mt-4 text-sm text-paper-dim">La toma quedó vacía. Revisa el micrófono{isVideo ? " y la cámara" : ""}.</p>
         )}
 
         <div className="mt-4 border-t border-line pt-4">
@@ -197,7 +197,7 @@ export function DownloadPanel({ recording, wordsRead, wordsTotal, gazePct = null
             </button>
           </div>
           <p className="mt-2 min-h-4 text-center text-xs text-[#ffb3ad]" role="status">
-            {confirm ? "Aún no descargaste esta toma: si sigues, se pierde." : ""}
+            {confirm ? "Sin descargar, la toma se pierde." : ""}
           </p>
         </div>
       </div>

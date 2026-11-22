@@ -6,6 +6,7 @@ import { IconCamera, IconChevronDown, IconRestart } from "./icons";
 import type { CameraStatus } from "@/hooks/useCamera";
 import { useCompositorTick } from "@/hooks/useCompositor";
 import type { CueGeometry } from "@/lib/persist";
+import { COUNTDOWN_FOCUS_SECS } from "@/lib/timer";
 import type { GazeDirection, GazeState, VideoCompositor } from "@/lib/video/compositor";
 
 type Props = {
@@ -164,7 +165,10 @@ export function VideoStage(p: Props) {
             <span key={p.countdown} className="countdown-num">
               {p.countdown}
             </span>
-            <span className="chip">{p.showGaze ? "Mira al lente: calibro tu mirada" : "Mira a la cámara"} · clic para cancelar</span>
+            {/* en una cuenta larga el principio es para acomodarse; mirar al lente solo importa al final */}
+            <span className="chip">
+              {p.countdown > COUNTDOWN_FOCUS_SECS ? "Acomódate" : p.showGaze ? "Mira al lente: calibro tu mirada" : "Mira a la cámara"} · clic para cancelar
+            </span>
           </div>
         </div>
       )}

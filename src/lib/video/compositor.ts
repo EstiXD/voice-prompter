@@ -170,10 +170,17 @@ const CALIB_MASKS = 28;
  * "Maestro" (experimental, solo con la opción "Conservar mi silla"): el modelo
  * fino no llega a 30 fps en un equipo de gama media, pero puede correr de vez
  * en cuando en un núcleo libre. Cada pasada marca qué reclama el modelo
- * rápido que no eres tú, y lo que se repite con un color raro en el fondo
- * (una silla) se recuerda y se deja fijo (ObjectTracker en mask.ts). Quieto,
- * una pasada cada 3 s; si la silueta cambió, antes, pero nunca más de una por
- * segundo: cada pasada son ~0,5 s de un núcleo al 100 %.
+ * rápido que no eres tú, y lo que se repite sin parecerse al fondo de al lado
+ * (una silla) se recuerda, crece hasta la silla entera y se deja fijo
+ * (ObjectTracker en mask.ts). Quieto, una pasada cada 3 s; si la silueta
+ * cambió, antes, pero nunca más de una por segundo: cada pasada son ~0,5 s de
+ * un núcleo al 100 %.
+ *
+ * Mientras te mueves casi no trabaja (ver TEACH_MOTION): ese medio segundo
+ * de núcleo se lo quitaba al modelo rápido justo cuando gesticulas (la
+ * máscara pasaba de 15 a 10 por segundo y las manos salían peor), y lo que
+ * aprendía en pleno gesto eran manos, no silla. Solo da una pasada cada 3 s
+ * (quieto y con la silueta cambiada serían hasta una por segundo).
  *
  * Lo que se probó y NO funciona, para no repetirlo: usar esas mismas zonas
  * para vetar la silla (mandarla al fondo). Abre huecos en las manos que
@@ -182,6 +189,15 @@ const CALIB_MASKS = 28;
 const TEACH_EVERY_MS = 3000;
 const TEACH_MIN_MS = 1000;
 const TEACH_DRIFT = 0.012;
+/**
+ * Si entre dos máscaras seguidas cambia más que esta fracción de la silueta,
+ * te estás moviendo (medido gesticulando con una mano: de 1,5 a 4 %).
+ */
+const TEACH_MOTION = 0.012;
+/** el maestro espera a que lleves este rato quieto… */
+const TEACH_CALM_MS = 600;
+/** …salvo que lleve todo esto sin pasar: lo que queda al descubierto al moverte necesita dos pasadas para reconocerse */
+const TEACH_MOVING_EVERY_MS = 3000;
 const FACE_MODEL = "/models/face_landmarker.task";
 
 type WasmFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
@@ -445,6 +461,11 @@ export class VideoCompositor {
   private teachAt = 0;
   /** la máscara del modelo rápido para el cuadro que está viendo el maestro */
   private teachFast: Uint8Array | null = null;
+  /** la máscara anterior y cuándo se vio movimiento por última vez (ver TEACH_MOTION) */
+  private lastMaskData: Uint8Array | null = null;
+  private movedAt = 0;
+  /** el color de tu pelo según el modelo fino (ver tellHead) */
+  private hairTone: number[] | null = null;
   private vetoBuf: Uint8Array | null = null;
   private vetoTmp: Uint8Array | null = null;
   /** midiendo si a este equipo le rinde más recortar en GPU o en CPU */
@@ -547,6 +568,7 @@ export class VideoCompositor {
     this.canvas = main.c;
     this.ctx = main.ctx;
     this.gl = GlRenderer.create(this.W, this.H);
+    this.gl?.setObjectMode(this.fx.keepChair);
     this.person = canvas2d(this.W, this.H);
     this.small = canvas2d(Math.max(2, Math.round(this.W / 6)), Math.max(2, Math.round(this.H / 6)));
     const m = canvas2d(2, 2);
@@ -705,12 +727,8 @@ export class VideoCompositor {
   setFx(fx: VideoFx): void {
     // ajustes guardados antes de existir la opción llegan sin ella: vale el valor por defecto
     fx = { ...DEFAULT_FX, ...fx };
-    if (fx.keepChair !== this.fx.keepChair) {
-      // lo aprendido de la silla deja de valer
-      this.objects.reset();
-      this.gl?.clearVeto();
-      this.teachAt = 0;
-    }
+    // la silla ya reconocida vale igual para conservarla que para borrarla: el cambio se ve al instante
+    this.gl?.setObjectMode(fx.keepChair);
     this.fx = { ...fx };
     if (fx.light || fx.beauty || fx.eyeContact || fx.gazeMeter || fx.studioLight) this.ensureFace();
   }
@@ -1104,14 +1122,22 @@ export class VideoCompositor {
     // copia antes de que nadie la toque: el maestro la compara con la suya
     if (r.id === this.teachId && !this.teachFast) this.teachFast = r.data.slice();
     else if (this.teachFast && this.teachAt && maskDrift(r.data, this.teachFast) > TEACH_DRIFT) this.teachAt = Math.min(this.teachAt, performance.now() - (TEACH_EVERY_MS - TEACH_MIN_MS));
+    if (this.canTeach) {
+      const last = this.lastMaskData;
+      if (last && last.length === r.data.length && maskDrift(r.data, last) > TEACH_MOTION) this.movedAt = performance.now();
+      this.lastMaskData = r.data;
+    }
     this.pendingMask = r;
     this.fpsMasks++;
     if (this.segLink) this.calibrateDelegate(this.segLink);
   }
 
-  /** El maestro solo trabaja si se pidió conservar la silla, con el modelo rápido y con WebGL2. */
+  /**
+   * El maestro trabaja con el modelo rápido y con WebGL2, se conserve la silla
+   * o no: para borrarla también hay que saber qué es silla.
+   */
   private teacherWanted(): boolean {
-    return this.canTeach && !!this.fx.keepChair && !!this.gl && !this.calib && this.profile.model === "lite" && this.activeModel() === "lite";
+    return this.canTeach && !!this.gl && !this.calib && this.profile.model === "lite" && this.activeModel() === "lite";
   }
 
   /** Le manda al maestro el mismo cuadro que acaba de salir hacia el modelo rápido. */
@@ -1137,6 +1163,7 @@ export class VideoCompositor {
     }
     const now = performance.now();
     if (this.teachAt && now - this.teachAt < TEACH_EVERY_MS) return;
+    if (now - this.movedAt < TEACH_CALM_MS && this.teachAt && now - this.teachAt < TEACH_MOVING_EVERY_MS) return;
     if (!this.teachOut) {
       const c = new OffscreenCanvas(w, h);
       const ctx = c.getContext("2d");
@@ -1158,7 +1185,6 @@ export class VideoCompositor {
     this.teachId = this.frame;
     this.teachFast = null;
     this.teachAt = now;
-    this.gl!.snapshotRef();
   }
 
   private onTeach(fine: MaskResult) {
@@ -1175,8 +1201,17 @@ export class VideoCompositor {
     }
     // lo que el modelo rápido reclama y el fino no: trozos de silla (y, alrededor de una mano, pared)
     vetoMap(fast, fine.data, fine.w, fine.h, this.vetoBuf, this.vetoTmp!, 1);
-    // de ahí, lo que se repite con un color raro en el fondo se queda contigo
-    this.gl.setTeach(this.objects.update(this.vetoBuf, fine.data, fine.pixels, vw, vh, fine.w), vw, vh);
+    // de ahí, lo que se repite sin parecerse al fondo de al lado ni a ti es la silla (ver ObjectTracker)
+    if (fine.tones?.hair) this.hairTone = fine.tones.hair;
+    // Si se está buscando tu cara y no aparece, no hay nadie: los "colores
+    // tuyos" que diera el modelo fino serían los de la propia silla (la
+    // confunde con ropa) y protegerían justo lo que hay que reconocer.
+    const nobody = this.faceLink?.state === "ready" && performance.now() - this.lastFaceAt > 1500;
+    const you = nobody ? [] : [fine.tones?.skin, fine.tones?.clothes];
+    this.objects.update(this.vetoBuf, fine.data, fine.pixels, vw, vh, fine.w, you);
+    this.gl.setYou(you[0], you[1]);
+    // al borrar la silla, su zona se ensancha: se lleva el canto y le da margen para mecerse contigo
+    this.gl.setTeach(this.objects.texture(fine.pixels, this.fx.keepChair ? 0 : 5, fine.data, fine.w), vw, vh);
   }
 
   /** Pasa a la GPU (o al camino 2D) la máscara que llegó del worker, si hay una nueva. */
@@ -1471,8 +1506,25 @@ export class VideoCompositor {
   // ----- pintar -----
 
   /** Camino GPU: fondo y persona en WebGL2; retoque y ojos encima en 2D. */
+  /**
+   * Le dice a la gráfica dónde está tu cabeza (la cara y el pelo de encima y
+   * de los lados): ahí nunca se borra la silla, aunque el color coincida.
+   */
+  private tellHead(gl: GlRenderer) {
+    const box = this.landmarks && performance.now() - this.lastFaceAt <= 400 ? this.faceBox() : null;
+    if (!box) {
+      gl.setHead(0, 0, 0, 0);
+      return;
+    }
+    // del óvalo de la cara a la cabeza entera: algo más ancho, bastante más hacia arriba (el pelo) y hasta la barbilla
+    const cx = (box.x + box.w / 2) / this.W;
+    const cy = (box.y + box.h * 0.3) / this.H;
+    gl.setHead(cx, cy, (box.w * 0.66) / this.W, (box.h * 0.72) / this.H, this.hairTone);
+  }
+
   private drawGl(wantSeg: boolean) {
     const gl = this.gl!;
+    this.tellHead(gl);
     const mode = !wantSeg ? 0 : this.bg.kind === "blur" ? 1 : this.bg.kind === "preset" || this.bg.kind === "custom" ? 2 : 0;
     const light = this.fx.light;
     gl.render({
